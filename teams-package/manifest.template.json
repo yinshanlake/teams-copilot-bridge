@@ -1,0 +1,48 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.23/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.23",
+  "version": "0.1.0",
+  "id": "{{BOT_ID}}",
+  "developer": {
+    "name": "{{DEVELOPER_NAME}}",
+    "websiteUrl": "{{WEBSITE_URL}}",
+    "privacyUrl": "{{PRIVACY_URL}}",
+    "termsOfUseUrl": "{{TERMS_URL}}"
+  },
+  "name": {
+    "short": "{{APP_NAME}}",
+    "full": "{{APP_NAME}}"
+  },
+  "description": {
+    "short": "Control your local Copilot sessions from a private Teams chat.",
+    "full": "Select or create Copilot sessions, follow work progress, answer pending questions, and change supported session settings. Access is restricted to the configured owner and tenant."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#2563EB",
+  "bots": [
+    {
+      "botId": "{{BOT_ID}}",
+      "scopes": ["personal"],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": ["personal"],
+          "commands": [
+            { "title": "!sessions", "description": "Find a main or side source, then !use its name or ID." },
+            { "title": "!history", "description": "Read the latest ten meaningful messages. Optional count: 1 to 50." },
+            { "title": "!status", "description": "Show the current source and notification status." },
+            { "title": "!subscribe", "description": "Receive future results from the exact selected source." },
+            { "title": "!unsubscribe", "description": "Stop that source's future subscription notifications." },
+            { "title": "!help", "description": "Show native chat and explicit ! command help." }
+          ]
+        }
+      ]
+    }
+  ],
+  "defaultInstallScope": "personal",
+  "validDomains": []
+}

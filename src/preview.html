@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Copilot Teams client - MOCK preview</title>
+  <link rel="stylesheet" href="/preview.css">
+  <script type="module" src="/preview.js"></script>
+</head>
+<body>
+  <aside>
+    <div class="brand">C<span>opilot</span><small>SESSION BRIDGE</small></div>
+    <div class="mock-badge">LOCAL MOCK</div>
+    <p>Real bridge controller, signed Submit cards, persistence and event delivery. Fake native runtime.</p>
+    <p>No Teams credentials. No cloud model calls. No shell or file execution.</p>
+    <h2>Try a working session</h2>
+    <p>Create a session, then send any text unchanged, or use these fixture scenarios:</p>
+    <div id="scenarios"></div>
+    <h2>Management</h2>
+    <p>Use <code>!sessions</code>, <code>!use &lt;name or ID&gt;</code>, <code>!history 10</code>, <code>!status</code>, <code>!subscribe</code> or <code>!unsubscribe</code>. Only explicit ! commands manage the bridge.</p>
+    <p class="fineprint">This is a safe HTML interpretation of Adaptive Card JSON, not the native Teams renderer. The production default is a separately provisioned new Bot on a trusted shared relay with Microsoft login. This preview connects to neither.</p>
+    <div id="connection">Connecting...</div>
+  </aside>
+  <main>
+    <header><div><h1>Your Copilot workbench</h1><p>One conversation. Independent persistent sessions.</p></div><button id="payload-toggle" class="quiet">Card JSON</button></header>
+    <div id="error" role="alert" hidden></div>
+    <section id="messages" aria-live="polite"></section>
+    <pre id="payload" hidden></pre>
+    <form id="composer"><label for="prompt">Message to the selected working session</label><div><textarea id="prompt" rows="2" placeholder="!sessions to choose a source, then talk here..."></textarea><button type="submit">Send</button></div><small>!sessions &middot; !use name-or-ID &middot; !history 10 &middot; !status &middot; !help</small></form>
+  </main>
+</body>
+</html>

@@ -1,0 +1,42 @@
+{
+  "name": "copilot-teams-client",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Owner-only Teams bridge to persistent native Copilot sessions.",
+  "engines": {
+    "node": "^22.12.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --import ./dist/test/block-network.js --test --test-concurrency=1 \"dist/test/*.test.js\"",
+    "start": "node --env-file-if-exists=.env dist/src/main.js",
+    "start:managed": "pwsh -NoLogo -NoProfile -File scripts/Run-Bridge.ps1",
+    "status:managed": "pwsh -NoLogo -NoProfile -File scripts/Run-Bridge.ps1 -Status",
+    "test:managed": "pwsh -NoLogo -NoProfile -File scripts/Test-ManagedBridge.ps1",
+    "models": "node --env-file-if-exists=.env dist/src/models.js",
+    "login:copilot": "node --env-file-if-exists=.env dist/src/login.js",
+    "simulate": "node dist/src/simulator.js",
+    "smoke:native": "node dist/scripts/native-smoke.js",
+    "check:source": "node dist/scripts/package-source.js --check",
+    "pack:source": "node dist/scripts/package-source.js"
+  },
+  "dependencies": {
+    "@azure/identity": "4.14.1",
+    "@github/copilot-sdk": "1.0.31",
+    "@microsoft/agents-activity": "1.10.1",
+    "@microsoft/agents-hosting": "1.10.1",
+    "@zip.js/zip.js": "2.24.0",
+    "express": "5.2.1",
+    "socket.io-client": "4.8.4"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "26.6.6",
+    "jwks-rsa": "4.0.1",
+    "socket.io": "4.8.4",
+    "typescript": "7.0.2"
+  }
+}
