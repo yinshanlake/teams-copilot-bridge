@@ -2,6 +2,8 @@ import type { PendingRequest, SessionRecord, TimelineEntry } from "./domain.js";
 import { object, safeText, string } from "./safety.js";
 
 export interface Projection {
+  // First seen for this canonical source, independent of visible timeline changes.
+  newEvent: boolean;
   changed: boolean;
   final?: { id: string; text: string };
   requestChanged?: boolean;
@@ -110,16 +112,16 @@ export class Projector {
 
   apply(record: SessionRecord, event: unknown, historical = false): Projection {
     if (!object(event) || !string(event.type) || !string(event.id) || !object(event.data) || event.checkpoint === true) {
-      return { changed: false };
+      return { newEvent: false, changed: false };
     }
     const ephemeral = event.ephemeral === true || event.type.endsWith("_delta") || event.type === "assistant.message_start";
     if (ephemeral) {
       const recent = this.ephemeralIds.get(record.id) ?? [];
-      if (recent.includes(event.id)) return { changed: false };
+      if (recent.includes(event.id)) return { newEvent: false, changed: false };
       recent.push(event.id);
       this.ephemeralIds.set(record.id, recent.slice(-1000));
     } else {
-      if (record.seenEvents.includes(event.id)) return { changed: false };
+      if (record.seenEvents.includes(event.id)) return { newEvent: false, changed: false };
       record.seenEvents.push(event.id);
       record.seenEvents = record.seenEvents.slice(-4000);
     }
@@ -419,6 +421,6 @@ export class Projector {
       record.sequence++;
       record.updatedAt = Date.now();
     }
-    return { changed, ...(final ? { final } : {}), ...(requestChanged ? { requestChanged: true } : {}) };
+    return { newEvent: true, changed, ...(final ? { final } : {}), ...(requestChanged ? { requestChanged: true } : {}) };
   }
 }

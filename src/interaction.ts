@@ -203,13 +203,14 @@ export function observeInteraction(state: BridgeState, incoming: RuntimeEvent): 
     }
   }
   if (event.type === "session.idle" || event.type === "abort" || event.type === "session.shutdown") delete ui.active[session.id];
+  const urgent = [
+    "user.message", "user_input.requested", "user_input.completed", "permission.requested", "permission.completed",
+    "exit_plan_mode.requested", "exit_plan_mode.completed", "session.idle", "session.error", "session.task_complete",
+    "session.shutdown", "abort", "bridge.app_admission_consumed", "bridge.app_admission_confirmed", "bridge.app_output_unavailable",
+    "bridge.permission_resolved", "bridge.approval_unconfirmed", "bridge.approval_timeout_submitted", "elicitation.requested", "elicitation.completed",
+  ].includes(String(event.type));
   for (const conversation of Object.values(state.conversations)) {
-    touchSurface(inbox(state, conversation.key), [
-      "user.message", "user_input.requested", "user_input.completed", "permission.requested", "permission.completed",
-      "exit_plan_mode.requested", "exit_plan_mode.completed", "session.idle", "session.error", "session.task_complete",
-      "session.shutdown", "abort", "bridge.app_admission_consumed", "bridge.app_admission_confirmed", "bridge.app_output_unavailable",
-      "bridge.permission_resolved", "bridge.approval_unconfirmed", "bridge.approval_timeout_submitted", "elicitation.requested", "elicitation.completed",
-    ].includes(String(event.type)));
+    touchSurface(inbox(state, conversation.key), urgent);
     if (session.kind !== "owned") continue;
     for (const pending of session.pending) {
       const existing = Object.values(ui.surfaces).find((surface) => surface.kind === "request" &&
@@ -223,17 +224,16 @@ export function observeInteraction(state: BridgeState, incoming: RuntimeEvent): 
       } else if (existing && existing.requestHash !== requestHash) {
         existing.requestHash = requestHash; existing.revision++; touchSurface(existing, true);
       }
-      for (const header of Object.values(ui.surfaces)) {
-        if (header.kind === "header" && header.sessionId === session.id && !header.frozen) {
-          const requestHash = digest(JSON.stringify(session.pending));
-          if (header.requestHash !== requestHash) {
-            header.requestHash = requestHash; header.revision++;
-          }
-          touchSurface(header, ["user.message", "user_input.requested", "user_input.completed", "permission.requested", "permission.completed",
-            "exit_plan_mode.requested", "exit_plan_mode.completed", "session.idle", "session.error", "session.task_complete",
-            "session.shutdown", "abort", "bridge.app_admission_consumed", "bridge.app_admission_confirmed", "bridge.app_output_unavailable",
-            "bridge.permission_resolved", "bridge.approval_unconfirmed", "bridge.approval_timeout_submitted", "elicitation.requested", "elicitation.completed"].includes(String(event.type)));
+    }
+  }
+  if (session.kind === "owned") {
+    const requestHash = digest(JSON.stringify(session.pending));
+    for (const header of Object.values(ui.surfaces)) {
+      if (header.kind === "header" && header.sessionId === session.id && !header.frozen) {
+        if (header.requestHash !== requestHash) {
+          header.requestHash = requestHash; header.revision++;
         }
+        touchSurface(header, urgent);
       }
     }
   }

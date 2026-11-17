@@ -123,6 +123,55 @@ test("UI-H1: the current session header clears completed approval controls while
   assert.equal(Object.values(after.interaction!.surfaces).filter((entry) => entry.kind === "header" && !entry.frozen).length, 1);
 });
 
+for (const completion of [
+  { name: "native completion", type: "permission.completed", data: {} },
+  { name: "timeout", type: "bridge.permission_resolved", data: { outcome: "timeout" } },
+  { name: "abort", type: "abort", data: {} },
+  { name: "shutdown", type: "session.shutdown", data: {} },
+]) test(`R2-F3: ${completion.name} clears the last pending request on the same header without staling another source`, async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const h = await harness(t, false, undefined, { interaction: options });
+  const a = await createWorking(h, "Unrelated approval");
+  await h.text("work A");
+  h.runtime.emit(a, "permission.requested", { requestId: randomUUID(),
+    permissionRequest: { kind: "shell", fullCommandText: "Write-Output 'A'" } });
+  await h.bridge.flush();
+  const unrelated = surface(h.bridge.store.snapshot(), "request", a);
+  const b = await createWorking(h, "Native completion");
+  await h.text("work B");
+  const requestId = randomUUID();
+  h.runtime.emit(b, "permission.requested", { requestId,
+    permissionRequest: { kind: "shell", fullCommandText: "Write-Output 'B'" } });
+  await h.text("!home");
+  await h.bridge.flush();
+  const before = h.bridge.store.snapshot();
+  const header = surface(before, "header", b);
+  const request = surface(before, "request", b);
+  assert.ok(header.activityId);
+  assert.match(JSON.stringify(h.transport.messages.get(header.activityId)), /Needs reply/);
+  assert.ok(findAction(h.transport.messages.get(header.activityId), "Allow once"));
+  const messages = h.transport.messages.size;
+  const updates = t.mock.method(h.transport, "update", h.transport.update.bind(h.transport));
+  h.runtime.emit(b, completion.type, completion.type === "abort" || completion.type === "session.shutdown"
+    ? {} : { requestId, ...completion.data });
+  await h.bridge.flush();
+  now += 6000;
+  await h.bridge.flush();
+  const after = h.bridge.store.snapshot();
+  assert.equal(after.sessions[b]!.pending.length, 0);
+  assert.equal(after.conversations[h.key]!.view, "home");
+  assert.equal(surface(after, "header", b).activityId, header.activityId);
+  const visible = h.transport.messages.get(header.activityId);
+  assert.doesNotMatch(JSON.stringify(visible), /Needs reply|"title":"Review approval"/);
+  assert.throws(() => findAction(visible, "Allow once"), /not found/);
+  assert.ok(after.interaction!.surfaces[request.id]!.frozen);
+  assert.deepEqual(after.interaction!.surfaces[unrelated.id], unrelated);
+  assert.equal(h.runtime.answers.length, 0);
+  assert.equal(h.transport.messages.size, messages, "updates must not repost a new header");
+  assert.equal(updates.mock.calls.filter((call) => call.arguments[1] === header.activityId).length, 1);
+});
+
 test("v3 read-only History does not select, while explicit Open still selects and preserves unresolved focus protection", async (t) => {
   const h = await harness(t, false, undefined, { interaction: options });
   const a = await createWorking(h, "Read target");
@@ -216,6 +265,71 @@ test("v3 each card coalesces progress independently but state transitions update
   h.runtime.emit(id, "abort");
   await h.bridge.flush();
   assert.equal(updates.mock.calls.filter((call) => call.arguments[1] === turn.activityId).length, 2);
+});
+
+test("R2-F2: replaying an exact completed event cannot finish the next executing turn on its source", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.text("task A");
+  const event = { id: randomUUID(), timestamp: new Date().toISOString(), data: { success: true, summary: "Task A only" } };
+  h.runtime.emit(id, "session.task_complete", event.data, event);
+  h.runtime.emit(id, "session.idle");
+  await h.bridge.flush();
+  const a = Object.values(h.bridge.store.snapshot().interaction!.turns)[0]!;
+  assert.equal(a.state, "done");
+  await h.text("task B");
+  await h.bridge.flush();
+  const before = h.bridge.store.snapshot();
+  const b = before.interaction!.turns[before.interaction!.active[id]!]!;
+  assert.notEqual(b.id, a.id);
+  assert.equal(b.state, "executing");
+  assert.equal(b.summary, undefined);
+  assert.ok(before.sessions[id]!.seenEvents.includes(event.id));
+  h.runtime.emit(id, "session.task_complete", event.data, event);
+  await h.bridge.flush();
+  const after = h.bridge.store.snapshot();
+  assert.deepEqual(after.interaction!.turns[b.id], b);
+  assert.deepEqual(after.interaction!.turns[a.id], a);
+  assert.deepEqual(after.interaction!.surfaces, before.interaction!.surfaces);
+  assert.deepEqual(after.outbox, before.outbox);
+});
+
+test("R2-F2: first-time ephemeral intent and progress are observed but replayed intent cannot cross turns", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.text("task A");
+  const intent = { id: randomUUID(), timestamp: new Date().toISOString(), ephemeral: true, data: { intent: "Task A intent" } };
+  h.runtime.emit(id, "assistant.intent", intent.data, intent);
+  await h.bridge.flush();
+  const a = Object.values(h.bridge.store.snapshot().interaction!.turns)[0]!;
+  assert.equal(a.intent, "Task A intent");
+  h.runtime.emit(id, "session.task_complete", { success: true });
+  h.runtime.emit(id, "session.idle");
+  await h.text("task B");
+  h.runtime.emit(id, "assistant.intent", { intent: "Task B intent" }, { ephemeral: true });
+  const toolCallId = randomUUID();
+  h.runtime.emit(id, "tool.execution_start", { toolCallId, toolName: "mock_inspect" }, { ephemeral: true });
+  h.runtime.emit(id, "tool.execution_complete", { toolCallId, success: true }, { ephemeral: true });
+  await h.bridge.flush();
+  const before = h.bridge.store.snapshot();
+  const b = before.interaction!.turns[before.interaction!.active[id]!]!;
+  assert.equal(b.state, "executing");
+  assert.equal(b.intent, "Task B intent");
+  assert.deepEqual(b.steps, [{ id: toolCallId, name: "mock_inspect", state: "done" }]);
+  assert.ok(!before.sessions[id]!.seenEvents.includes(intent.id), "ephemeral dedup must not depend on the durable journal IDs");
+  h.runtime.emit(id, "assistant.intent", intent.data, intent);
+  await h.bridge.flush();
+  const after = h.bridge.store.snapshot();
+  assert.deepEqual(after.interaction!.turns[b.id], b);
+  assert.deepEqual(after.interaction!.surfaces, before.interaction!.surfaces);
+  h.runtime.emit(id, "session.idle");
+  await h.bridge.flush();
+  const sequence = h.bridge.store.snapshot().sessions[id]!.sequence;
+  assert.equal(h.bridge.store.snapshot().interaction!.active[id], undefined);
+  h.runtime.emit(id, "user.message", { messageId: b.messageId, content: "" }, { ephemeral: true });
+  await h.bridge.flush();
+  assert.equal(h.bridge.store.snapshot().sessions[id]!.sequence, sequence, "consumption need not change the visible timeline");
+  assert.equal(h.bridge.store.snapshot().interaction!.active[id], b.id, "a new event must still update native correlation");
 });
 
 test("v3 schema migration preserves a populated legacy journal, sent bytes, uncertainty and enabled-but-paused subscription", async (t) => {
@@ -724,6 +838,63 @@ test("v3 Steer sends immediate unchanged text to the original owned source witho
   assert.equal(result.originReference?.activityId, "original-steering-context");
   await h.action(steering, { steering: "a changed duplicate cannot run" });
   assert.equal(h.runtime.received.length, 2);
+});
+
+for (const path of ["result", "steering"] as const) test(`R2-F1: real Control-origin ${path} receipts retain their IDs and reopen safely`, async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = await createWorking(h, "Control destination");
+  await h.text("!control send the exact task to the selected source");
+  const controller = h.bridge.store.snapshot().controllerId!;
+  const send = h.runtime.live.get(controller)!.tools.find((tool) => tool.name === "bridge_send");
+  assert.ok(send?.handler);
+  const invoke = send.handler;
+  const parameters = { sessionId: id, text: "Exact Control-origin task" };
+  const invocation = { sessionId: controller, toolCallId: randomUUID(), toolName: "bridge_send", arguments: parameters };
+  const receiptId = `control-tool:${controller}:${invocation.toolCallId}`;
+  assert.equal(receiptId.length, 86);
+  await invoke(parameters, invocation);
+  await h.bridge.flush();
+  let state = h.bridge.store.snapshot();
+  assert.equal(state.receipts[receiptId]!.status, "accepted");
+  const turn = state.interaction!.turns[receiptId]!;
+  assert.equal(turn.state, "executing");
+  assert.ok(turn.messageId);
+  if (path === "result") {
+    h.runtime.emit(id, "assistant.message", { messageId: "control-result", originatingMessageId: turn.messageId,
+      content: "Correlated Control-origin result", phase: "final" });
+    h.runtime.emit(id, "session.task_complete", { success: true });
+    h.runtime.emit(id, "session.idle");
+    await h.bridge.flush();
+    state = h.bridge.store.snapshot();
+    const result = state.outbox.find((item) => item.eventId === "control-result")!;
+    assert.equal(result.status, "sent");
+    assert.equal(result.direct, true);
+    assert.equal(result.publication?.taskReceiptId, receiptId);
+  } else {
+    await h.action(findAction(renderInteractionSurface(state, surface(state, "turn", id), h.bridge.cards), "Send steering"),
+      { steering: "Preserve the original Control task" });
+    await h.bridge.flush();
+    state = h.bridge.store.snapshot();
+    const steer = Object.values(state.interaction!.steers!)[0]!;
+    assert.equal(steer.state, "accepted");
+    assert.equal(steer.parentTurnId, receiptId);
+    assert.equal(state.directOrigins[steer.id]!.parentTurnId, receiptId);
+    assert.equal(state.outbox.length, 0, "restart must cover steering before any result");
+  }
+  const received = h.runtime.received.length;
+  await assert.rejects(async () => invoke(parameters, invocation), /already received/);
+  assert.equal(h.runtime.received.length, received);
+  await h.bridge.close();
+  const reopened = await Store.open(h.directory, "test-owner");
+  try {
+    const restored = reopened.snapshot();
+    assert.deepEqual(restored.receipts, state.receipts);
+    assert.equal(JSON.stringify(restored.outbox), JSON.stringify(state.outbox));
+    assert.equal(JSON.stringify(restored.directOrigins), JSON.stringify(state.directOrigins));
+    assert.deepEqual(restored.interaction!.steers, state.interaction!.steers);
+    assert.equal(restored.interaction!.turns[receiptId]!.id, receiptId);
+    assert.equal(restored.interaction!.turns[receiptId]!.state, path === "result" ? "done" : "uncertain");
+  } finally { await reopened.close(); }
 });
 
 test("v3 permission details are redacted, session approval is explicit, and off offers no permission or plan Allow controls", async (t) => {

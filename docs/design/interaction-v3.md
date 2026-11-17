@@ -99,10 +99,25 @@ Older readers reject it rather than silently ignore Stop/approval state. Pending
 controls are invalidated across restart, uncertain outcomes remain uncertain,
 and no accepted task or decision is replayed. Backout after new acceptance must
 retain the schema-aware state; an old database restore is not a safe downgrade.
-Phase 3 build/typecheck and all 303 offline tests passed, including every
-cold-review regression. The final source audit and all four Windows package
-checks passed. Runtime/tenant preview gates remain deliberately unverified;
+The initial Phase 3 freeze passed build/typecheck and all 303 offline tests,
+including the Phase 1 cold-review regressions. Its source audit and all four
+Windows package checks passed. Runtime/tenant preview gates remain deliberately unverified;
 these offline results do not authorize deployment or certify real Teams/SDK use.
+
+Post-freeze cold-review corrections preserve the existing 512-character receipt
+ID bound for result task references and both steering parent references. Genuine
+`control-tool:<controller UUID>:<tool-call UUID>` receipts remain unchanged across
+restart; no dedup ID is shortened or rehashed. Interaction transitions now share
+the projector's canonical source/event dedup decision, including its separate
+ephemeral cache, rather than treating a visible timeline change as event novelty.
+Current headers refresh once per source event even when native completion,
+timeout, abort or shutdown removes the final pending request. This updates the
+same activity without invalidating another source's pending request surface.
+The fixes do not change schema 4, dependencies, endpoint source or capability gates.
+A schema-4 label alone is insufficient for backout: binaries with the former
+64-character task/parent-reference checks cannot reopen Control-origin state.
+The corrected candidate passed build/typecheck, all 311 offline tests (including
+eight new regressions), and all four Windows package checks.
 
 ## Historical design evidence
 

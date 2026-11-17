@@ -1959,7 +1959,7 @@ export class Bridge {
         }
         if (admission.phase === "confirmed") settledAdmissionId = admission.id;
       }
-      if (this.options.interaction) observeInteraction(state, incoming);
+      if (this.options.interaction && result.newEvent) observeInteraction(state, incoming);
       if (!result.changed && !admissionChanged) return false;
       for (const conversation of Object.values(state.conversations)) {
         const viewing = viewTarget(state, conversation) === session.id;

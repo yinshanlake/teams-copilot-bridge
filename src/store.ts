@@ -80,7 +80,7 @@ function interaction(value: unknown): boolean {
   if (value.remoteApprovals !== undefined && typeof value.remoteApprovals !== "boolean") return false;
   if (value.steers !== undefined && (!object(value.steers) || !Object.entries(value.steers).every(([id, entry]) =>
     object(entry) && entry.id === id && string(id, 64) && canonicalId(entry.sessionId) &&
-    string(entry.conversationKey) && string(entry.parentTurnId, 64) && integer(entry.at) &&
+    string(entry.conversationKey) && string(entry.parentTurnId) && integer(entry.at) &&
     ["sending", "accepted", "uncertain", "rejected"].includes(String(entry.state)) &&
     (entry.messageId === undefined || string(entry.messageId, 512))))) return false;
   if (value.aliases !== undefined && (!object(value.aliases) || !Object.entries(value.aliases).every(([key, target]) =>
@@ -137,7 +137,7 @@ function isState(value: unknown, owner: string): value is BridgeState {
     ["admitting", "accepted", "failed"].includes(String(item.status)) && typeof item.at === "number" &&
     (item.answered === undefined || typeof item.answered === "boolean") &&
     (item.reference === undefined || object(item.reference)) &&
-    (item.parentTurnId === undefined || string(item.parentTurnId, 64)) &&
+    (item.parentTurnId === undefined || string(item.parentTurnId)) &&
     (item.messageId === undefined || string(item.messageId, 512))))) return false;
   return Object.entries(value.sessions).every(([id, item]) =>
     object(item) && canonicalId(id) && item.id === id && string(item.name) &&
@@ -182,7 +182,7 @@ function isState(value: unknown, owner: string): value is BridgeState {
       (item.originReference === undefined || object(item.originReference)) &&
       (item.publication === undefined || object(item.publication) && item.publication.version === 1 &&
         string(item.publication.title, 512) && canonicalId(item.publication.surfaceId) &&
-        (item.publication.taskReceiptId === undefined || string(item.publication.taskReceiptId, 64))) &&
+        (item.publication.taskReceiptId === undefined || string(item.publication.taskReceiptId))) &&
       (item.digest === undefined || object(item.digest) && item.digest.version === 1 && canonicalId(item.digest.surfaceId) &&
         Array.isArray(item.digest.memberIds) && item.digest.memberIds.length >= 3 && item.digest.memberIds.length <= 64 &&
         item.digest.memberIds.every((id) => string(id, 64))) &&
