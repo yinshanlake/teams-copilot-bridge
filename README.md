@@ -15,6 +15,79 @@ owner identity, Copilot entitlement/sign-in, private `.env`, and local state.
 No shared portal, existing installation, or another operator's credentials are
 required for the direct-webhook route below.
 
+## Start here
+
+| What you need | Where to go |
+| --- | --- |
+| Use an already installed bot from your phone | [Phone workflow in pictures](#phone-workflow-in-pictures) |
+| Set up your own bot | [Prerequisites](#prerequisites-and-compatibility), then [first run](#first-run-independent-authenticated-webhook) |
+| Connect existing App/CLI sessions | [Endpoint installation](extensions/teams-session-endpoint/README.md) |
+| Try the UI without accounts or cloud calls | Build the source, run `npm run simulate`, then open `http://127.0.0.1:3979` |
+| Look up a command | [Everyday use](#everyday-use) |
+
+## Phone workflow in pictures
+
+After [installing your own bot](#6-build-and-import-your-personal-teams-app),
+open its personal chat in Teams on your phone. Keep the computer, original
+Copilot host, bridge backend, and configured network route running.
+
+**These are cropped screenshots of the bundled local MOCK preview, not native
+Teams screenshots.** All names, IDs, requests, and results are synthetic. The
+preview renders the current bridge's cards without Teams credentials, model
+calls, or tool execution. Native Teams and mobile layouts can differ.
+
+### 1. Find a session and check the target
+
+Send **`!sessions`**, or tap **All sessions** in the Inbox. Enter a name in
+**Find a session**, tap **Search**, then **Open** on the intended session.
+Check **Next message ->** in the current header before sending work.
+
+![Local MOCK session picker with Search, two synthetic sessions, and Open controls](docs/images/sessions-demo.png)
+
+To switch again, tap **Change next target** in the current session header.
+That entry, and **All sessions** from the Inbox, now post a fresh picker near
+the latest chat activity instead of editing an old off-screen message.
+Search, page navigation, and Refresh stay on that picker.
+
+Opening the picker alone does **not** switch the target. Choosing **Open**
+selects the source and shows its read-only history; it does not send a task.
+If names are ambiguous, use **`!use <canonical-session-ID>`** instead.
+
+### 2. Send work, then read the result
+
+Use the normal Teams message composer for the task, for example:
+`Summarize the README quick start.`
+The bridge forwards that text unchanged to the selected writable source.
+Only commands starting with **`!`** control the bridge.
+
+The task card tracks that request separately from its result delivery. A result
+preview identifies the source and original task receipt. Tap **Show full** to
+read the full result without rerunning the task or changing the next target.
+Use **`!history`** to read the selected source's recent conversation.
+
+![Local MOCK completed-result card with a source reference and Show full](docs/images/result-demo.png)
+
+Changing the next-message target does not move earlier tasks or their results
+to another session. An uncertain send is not permission to resend the prompt.
+
+### 3. Check what needs you
+
+Send **`!home`** to open the Inbox. It shows the next-message target, observed
+requests, running work, and recent results. Opening the Inbox itself does not
+change the target.
+
+![Local MOCK Inbox showing the next target, a pending request, and a recent result](docs/images/inbox-demo.png)
+
+For **bot-created sessions**, use the separate request card to answer a question
+or review an offered approval. Stop requires its own confirmation. For
+**existing App/CLI sessions**, permissions and controls stay in the original
+host; the Inbox does not guess whether that host is waiting for approval.
+See [owned-session controls](#owned-session-controls) for the exact limits.
+
+An accepted task follows its source for 24 hours by default. Use **`!subscribe`**
+for an explicit follow without expiry, or **`!unsubscribe`** to mute passive
+notifications. Muting does not suppress replies to tasks you already sent.
+
 ## Prerequisites and compatibility
 
 - A Windows computer that can remain running. The Teams ZIP builder requires
@@ -236,6 +309,16 @@ work. Native management peers without a correlatable message ID stay read-only.
 The included core preserves durable history/outbox formats: new complex-text
 messages use the v4 escaped basic-HTML/XML fallback, while already persisted
 legacy payloads are not rewritten or reposted.
+
+### If something looks stuck
+
+| Symptom | Next action |
+| --- | --- |
+| A switch button seems to do nothing, or an old card is stale | Send `!sessions` and use the latest picker; select a row with Open, then check Next message ->. |
+| A source is read-only | Keep its original host open and verify the endpoint is loaded. History access alone does not make a source writable. |
+| An existing App session appears to need approval | Check that session in the original App/CLI. Remote App approval state is not inferred. |
+| A task or delivery says uncertain | Read `!status` and `!history`, and inspect the original session before deciding what to do. Do not blindly resend work. |
+| The bot stops replying | Check the computer, backend, and tunnel or relay. Importing the Teams ZIP does not keep any of them running. |
 
 ### Interaction v3
 
