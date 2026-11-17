@@ -245,6 +245,11 @@ evidence; a busy heartbeat is not a permission request. Native request cards hav
 their own signed surface, so changing focus or refreshing the Inbox does not
 invalidate another pending request.
 
+Opening **All sessions** or **Change next target** from an independent Inbox,
+header or task card posts a fresh picker near the latest chat activity. Search,
+pagination and Refresh update that same picker. Opening it does not change the
+selected destination or send work; choose **Open** on the desired session.
+
 An accepted Teams task automatically follows that source for 24 hours, including
 after an earlier Mute. Explicit `!subscribe` has no expiry. App following uses the
 existing durable local cursor; owned SDK sessions are **live-only**, with no

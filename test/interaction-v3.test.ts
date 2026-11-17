@@ -11,7 +11,7 @@ import { mockEnvelope, mockIdentity } from "../src/simulator.js";
 import { authorizeActivity, outboundActivity } from "../src/teams.js";
 import { inputSuffix } from "../src/cards.js";
 import { Store } from "../src/store.js";
-import { digest, object, UncertainOperationError } from "../src/safety.js";
+import { DeliveryError, digest, object, UncertainOperationError } from "../src/safety.js";
 import { createWorking, eventually, findAction, harness, temporary, type Harness } from "./helpers.js";
 
 const options = { ...interactionDefaults, statusUpdateMs: 5000, digestMs: 60_000 };
@@ -188,6 +188,119 @@ test("v3 read-only History does not select, while explicit Open still selects an
   await h.text("must not reach the retained selection");
   assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectionBlocked, true);
   assert.equal(h.runtime.received.length, 1);
+});
+
+for (const kind of ["inbox", "header", "turn"] as const) test(`v3 picker entry from ${kind} posts below newer activity and keeps picker navigation in place`, async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options, cardActions: "submit" });
+  const b = await createWorking(h, "Switch destination");
+  await createWorking(h, "Other one");
+  await createWorking(h, "Other two");
+  const a = await createWorking(h, "Original focus");
+  const deliveredCard = (id: string | undefined) => {
+    assert.ok(id);
+    const delivered = h.transport.messages.get(id);
+    assert.ok(delivered?.message.type === "card");
+    return delivered.message.card;
+  };
+  await h.text("!sessions");
+  await h.bridge.flush();
+  await h.action(findAction(deliveredCard(h.bridge.store.snapshot().conversations[h.key]!.dashboardId), "Search"),
+    { query: "Original focus" });
+  await h.bridge.flush();
+  const oldPicker = h.bridge.store.snapshot().conversations[h.key]!;
+  const oldOpen = findAction(deliveredCard(oldPicker.dashboardId), "Open");
+  await h.text("work after opening the old picker");
+  h.runtime.emit(a, "assistant.message", { messageId: "picker-result", content: "Visible newer result", phase: "final" });
+  h.runtime.emit(a, "session.task_complete", { success: true });
+  h.runtime.emit(a, "session.idle");
+  await h.bridge.flush();
+  await h.action(findAction(deliveredCard(surface(h.bridge.store.snapshot(), "result", a).activityId), "Show full"));
+  await h.bridge.flush();
+  const before = h.bridge.store.snapshot();
+  const history = before.outbox.findLast((item) => item.historyId)!;
+  assert.equal(history.status, "sent");
+  assert.ok(history.activityId);
+  assert.equal(before.conversations[h.key]!.view, "sessions", "an old list view does not prove its card is visible");
+  assert.equal(before.conversations[h.key]!.dashboardId, oldPicker.dashboardId);
+  const entry = findAction(deliveredCard(surface(before, kind, kind === "inbox" ? undefined : a).activityId),
+    kind === "inbox" ? "All sessions" : "Change next target");
+  const sends = structuredClone(h.runtime.received);
+  const activityId = randomUUID();
+  await h.action(entry, {}, activityId);
+  await h.bridge.flush();
+  const picker = h.bridge.store.snapshot().conversations[h.key]!;
+  assert.ok(picker.dashboardId);
+  assert.notEqual(picker.dashboardId, oldPicker.dashboardId);
+  assert.notEqual(picker.surfaceId, oldPicker.surfaceId);
+  const activities = [...h.transport.messages.keys()];
+  assert.ok(activities.indexOf(picker.dashboardId) > activities.indexOf(history.activityId),
+    "explicit entry must create the picker after the newer history, not update the offscreen message");
+  assert.equal(deliveredCard(picker.dashboardId).body[0]?.text, "Sessions");
+  assert.equal(picker.selectedId, a);
+  assert.equal(picker.query, undefined);
+  assert.deepEqual(h.runtime.received, sends);
+  const messageCount = h.transport.messages.size;
+  await h.action(entry, {}, activityId);
+  await h.bridge.flush();
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.dashboardId, picker.dashboardId);
+  assert.equal(h.transport.messages.size, messageCount, "a duplicate activity must not post another picker");
+  await h.action(findAction(deliveredCard(picker.dashboardId), "Next"));
+  await h.bridge.flush();
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.page, 1);
+  await h.action(findAction(deliveredCard(picker.dashboardId), "Search"), { query: "Switch destination" });
+  await h.bridge.flush();
+  await h.action(findAction(deliveredCard(picker.dashboardId), "Refresh"));
+  await h.bridge.flush();
+  const filtered = h.bridge.store.snapshot().conversations[h.key]!;
+  assert.equal(filtered.dashboardId, picker.dashboardId);
+  assert.equal(filtered.surfaceId, picker.surfaceId);
+  assert.equal(filtered.query, "Switch destination");
+  assert.equal(filtered.page, 0);
+  assert.equal(filtered.selectedId, a);
+  assert.equal(h.transport.messages.size, messageCount, "page/search/refresh must update the same picker");
+  assert.deepEqual(h.runtime.received, sends);
+  await h.action(findAction(deliveredCard(picker.dashboardId), "Open"));
+  await h.bridge.flush();
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b);
+  assert.deepEqual(h.runtime.received, sends, "explicit Open selects but never sends work");
+  await h.action(oldOpen);
+  await h.bridge.flush();
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b, "a replaced picker's Open cannot retarget work");
+  assert.match(h.bridge.store.snapshot().conversations[h.key]!.notice, /operation card was replaced/);
+  assert.deepEqual(h.runtime.received, sends);
+});
+
+test("v3 picker entry with an uncertain send is not replayed by duplicate clicks or background progress", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.text("!sessions");
+  await h.bridge.flush();
+  const before = h.bridge.store.snapshot();
+  const header = surface(before, "header", id);
+  const entry = findAction(h.transport.messages.get(header.activityId!), "Change next target");
+  const send = h.transport.send.bind(h.transport);
+  let pickerSends = 0;
+  t.mock.method(h.transport, "send", async (reference: Parameters<typeof send>[0], message: Parameters<typeof send>[1]) => {
+    if (message.type === "card" && message.card.body[0]?.text === "Sessions") {
+      pickerSends++;
+      throw new DeliveryError("uncertain", "TIMEOUT");
+    }
+    return send(reference, message);
+  });
+  const activityId = randomUUID();
+  await h.action(entry, {}, activityId);
+  await h.bridge.flush();
+  assert.equal(pickerSends, 1);
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.dashboardState, "uncertain");
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.dashboardId, undefined);
+  await h.action(entry, {}, activityId);
+  h.runtime.emit(id, "session.idle");
+  await h.bridge.flush();
+  await h.bridge.flush();
+  assert.equal(pickerSends, 1);
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.dashboardState, "uncertain");
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, id);
+  assert.deepEqual(h.runtime.received, []);
 });
 
 test("v3 automatic following overrides Mute on a new accepted send, expires without cancelling direct obligations, and explicit Follow has no expiry", async (t) => {

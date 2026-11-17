@@ -846,7 +846,9 @@ export class Bridge {
             this.startCatalogueRefresh();
             return;
           }
-          await this.showSessions(key, false, false, view);
+          const fresh = view === "sessions" && claims.surfaceId !== undefined &&
+            claims.surfaceId !== this.store.snapshot().conversations[key]!.surfaceId;
+          await this.showSessions(key, fresh, false, view);
           return;
         }
         if (view === "home") {
