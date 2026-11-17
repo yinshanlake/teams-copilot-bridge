@@ -9,6 +9,7 @@ import { Server, type Socket as ServerSocket } from "socket.io";
 import { io } from "socket.io-client";
 import type { AccessToken } from "@azure/identity";
 import type { CopilotSession } from "@github/copilot-sdk";
+import type { Card, Outbound } from "../src/domain.js";
 import { configuration, nativeCliConfiguration, nativeConfiguration } from "../src/config.js";
 import { validateRelayConfig, readRelayBundle, type RelayBinding } from "../src/relay-config.js";
 import { AzureRelayTokenSource, MicrosoftSignInRequired, type RelayTokenSource } from "../src/relay-auth.js";
@@ -17,11 +18,12 @@ import { nativeClientOptions } from "../src/native.js";
 import { nativeLoginFlow } from "../src/login.js";
 import { DeliveryError, object, UserError } from "../src/safety.js";
 import { mockEnvelope, mockIdentity } from "../src/simulator.js";
-import { validateTeamsOwnerActivity } from "../src/teams.js";
+import { outboundActivity, validateTeamsOwnerActivity } from "../src/teams.js";
 import { Bridge } from "../src/bridge.js";
 import { FakeRuntime } from "../src/fake-runtime.js";
 import { Store } from "../src/store.js";
 import { inputSuffix } from "../src/cards.js";
+import { interactionDefaults } from "../src/interaction.js";
 import { findAction, eventually, temporary } from "./helpers.js";
 import { withLoopback } from "./block-network.js";
 
@@ -344,6 +346,157 @@ test("relay timeout/disconnect are uncertain, offline sends are not emitted, and
     await new Promise((resolve) => setTimeout(resolve, 40));
     assert.equal(handshakes.length, count);
   });
+});
+
+test("relay summary cards emit one attachment-only Activity and settle normal send/update ACKs", async (t) => {
+  await loopback(t, async ({ relay, sockets, packets }) => {
+    await relay.start(async () => undefined);
+    const reference = validateTeamsOwnerActivity(mockEnvelope(), mockIdentity, true).reference;
+    let combinedFailures = 0;
+    for (const event of ["sendActivity", "updateActivity"]) sockets[0]!.on(event, (payload: Record<string, unknown>) => {
+      const activity = payload.activity;
+      const combined = object(activity) && Array.isArray(activity.attachments) && activity.attachments.length > 0 &&
+        (activity.text !== undefined || activity.textFormat !== undefined);
+      if (combined) combinedFailures++;
+      sockets[0]!.emit("sendResult", {
+        type: "sendResult", requestId: payload.requestId,
+        ...(combined ? { error: { code: "SEND_FAILED" } } : { messageId: payload.messageId ?? "card-only-message" }),
+      });
+    });
+    const card: Card = {
+      type: "AdaptiveCard", version: "1.5", $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+      body: [{ type: "TextBlock", text: "Done - synthetic source", weight: "Bolder", wrap: true },
+        { type: "TextBlock", text: "The result stays in this card.", wrap: true }],
+      actions: [{ type: "Action.Submit", title: "Open", data: { token: "synthetic-scoped-token" } }],
+    };
+    const message: Outbound = { type: "card", card, summary: "Copilot reply - password=summary-fixture" };
+    const unchanged = structuredClone(message);
+    const webhook = JSON.stringify(outboundActivity(message));
+    const id = await relay.send(reference, message);
+    assert.equal(id, "card-only-message");
+    assert.equal(packets.length, 1, "summary must not be emitted as another message");
+    const activity = packets[0]!.payload.activity;
+    assert.ok(object(activity) && Array.isArray(activity.attachments));
+    assert.ok(!("text" in activity) && !("textFormat" in activity));
+    assert.equal(activity.attachments.length, 1);
+    const expected: Card = { ...card, body: [
+      { ...card.body[0], text: "Copilot reply - password=[REDACTED]\n\nDone - synthetic source" },
+      ...card.body.slice(1),
+    ] };
+    assert.deepEqual(activity.attachments[0], { contentType: "application/vnd.microsoft.card.adaptive", content: expected });
+    assert.deepEqual(message, unchanged, "relay normalization must not mutate cards or signed action data");
+    assert.equal(JSON.stringify(outboundActivity(message)), webhook, "webhook serialization stays unchanged");
+    await relay.update(reference, id, expected);
+    assert.equal(packets.length, 2);
+    assert.equal(packets[1]!.event, "updateActivity");
+    assert.equal(packets[1]!.payload.messageId, id);
+    assert.deepEqual(packets[1]!.payload.activity, activity);
+    assert.equal(combinedFailures, 0, "the legacy combined-payload failure must not be triggered");
+  }, { acknowledgementMs: 300 });
+});
+
+test("relay card normalization preserves exact plain text and XML history Activity bytes", async (t) => {
+  await loopback(t, async ({ relay, sockets, packets }) => {
+    await relay.start(async () => undefined);
+    const reference = validateTeamsOwnerActivity(mockEnvelope(), mockIdentity, true).reference;
+    sockets[0]!.on("sendActivity", (payload: Record<string, unknown>) => {
+      sockets[0]!.emit("sendResult", { type: "sendResult", requestId: payload.requestId, messageId: "text-message" });
+    });
+    const messages: Outbound[] = [
+      { type: "text", text: "  unchanged plain\r\n**literal** <tag> & value  " },
+      { type: "text", text: "History body\r\n\r\n<synthetic> & `code`", presentation: {
+        version: 4, kind: "history", title: "Synthetic history", sourceId: randomUUID(),
+        format: "xml", groupId: "synthetic-history", part: 1, parts: 1,
+      } },
+    ];
+    for (const message of messages) {
+      const expected = JSON.stringify(outboundActivity(message));
+      assert.equal(await relay.send(reference, message), "text-message");
+      assert.equal(JSON.stringify(packets.at(-1)!.payload.activity), expected);
+    }
+    assert.equal(packets.length, messages.length);
+  }, { acknowledgementMs: 300 });
+});
+
+test("v3 relay normal ACKs settle new cards without reposting uncertain Inbox or result deliveries", async (t) => {
+  const directory = await temporary(t);
+  await loopback(t, async ({ relay, sockets, packets, binding }) => {
+    const runtime = new FakeRuntime(2, false, true, interactionDefaults);
+    const store = await Store.open(directory, `relay-fixture:${binding.fingerprint}`);
+    const bridge = new Bridge(store, runtime, relay, {
+      owner: store.snapshot().owner, workspaces: [{ id: "local", name: "Local", path: directory }],
+      coalesceMs: 2, cardActions: "submit", deliveryInitiallyPaused: true, interaction: interactionDefaults,
+    });
+    let failCard: "inbox" | "result" | undefined = "inbox";
+    let combinedFailures = 0;
+    const failedRequests: string[] = [];
+    try {
+      await bridge.start();
+      await relay.start(async (turn) => { await bridge.handle(turn.key, turn.reference, turn.activity.id!, turn.incoming); });
+      for (const event of ["sendActivity", "updateActivity"]) sockets[0]!.on(event, (payload: Record<string, unknown>) => {
+        const activity = payload.activity;
+        const content = object(activity) && Array.isArray(activity.attachments) ? activity.attachments[0] : undefined;
+        const combined = content && object(activity) && (activity.text !== undefined || activity.textFormat !== undefined);
+        if (combined) combinedFailures++;
+        const reject = event === "sendActivity" && Boolean(content) && Boolean(combined ||
+          failCard === "inbox" && JSON.stringify(content).includes("Copilot Sessions - Inbox") ||
+          failCard === "result" && JSON.stringify(content).includes("uncertain-result-body"));
+        if (reject) {
+          failedRequests.push(String(payload.requestId));
+          if (!combined) failCard = undefined;
+        }
+        sockets[0]!.emit("sendResult", {
+          type: "sendResult", requestId: payload.requestId,
+          ...(reject ? { error: { code: "SEND_FAILED" } } : { messageId: payload.messageId ?? `acked:${payload.requestId}` }),
+        });
+      });
+      bridge.enableDelivery();
+      const handle = async (text: string, value?: unknown) => {
+        const envelope = { ...mockEnvelope(text), ...(value === undefined ? {} : { value }) };
+        const turn = validateTeamsOwnerActivity(envelope, mockIdentity, true);
+        return bridge.handle(turn.key, turn.reference, turn.activity.id!, turn.incoming);
+      };
+      const key = validateTeamsOwnerActivity(mockEnvelope(), mockIdentity, true).key;
+      await handle("!home");
+      await bridge.flush();
+      const oldInbox = Object.values(store.snapshot().interaction!.surfaces).find((surface) => surface.kind === "inbox" && !surface.frozen)!;
+      assert.equal(oldInbox.delivery, "uncertain");
+      const form = await handle("!new");
+      const create = findAction(form, "Create");
+      assert.ok(object(create.data));
+      await handle("", { ...create.data, sessionName: "Relay summaries", workspace: "local" });
+      const id = store.snapshot().conversations[key]!.selectedId!;
+      await handle("first exact task");
+      failCard = "result";
+      runtime.emit(id, "assistant.message", { messageId: "uncertain-result", content: "uncertain-result-body", phase: "final" });
+      runtime.emit(id, "session.task_complete", { success: true });
+      runtime.emit(id, "session.idle");
+      await bridge.flush();
+      const oldResult = store.snapshot().outbox.find((item) => item.eventId === "uncertain-result")!;
+      assert.equal(oldResult.status, "uncertain");
+      const resultSurfaceId = oldResult.publication!.surfaceId;
+      assert.equal(store.snapshot().interaction!.surfaces[resultSurfaceId]!.delivery, "uncertain");
+      assert.equal(failedRequests.length, 2);
+      await handle("second exact task");
+      runtime.emit(id, "assistant.message", { messageId: "acked-result", content: "acked-result-body", phase: "final" });
+      runtime.emit(id, "session.task_complete", { success: true });
+      runtime.emit(id, "session.idle");
+      await bridge.flush();
+      await bridge.flush();
+      const after = store.snapshot();
+      assert.equal(after.outbox.find((item) => item.eventId === "acked-result")?.status, "sent");
+      assert.match(after.outbox.find((item) => item.eventId === "acked-result")!.activityId!, /^acked:/);
+      assert.deepEqual(after.outbox.find((item) => item.id === oldResult.id), oldResult);
+      assert.equal(after.interaction!.surfaces[oldInbox.id]!.delivery, "uncertain");
+      assert.equal(after.interaction!.surfaces[resultSurfaceId]!.delivery, "uncertain");
+      assert.equal(failedRequests.length, 2, "uncertain sends must not be retried");
+      const sends = packets.filter((packet) => packet.event === "sendActivity");
+      assert.equal(sends.filter((packet) => JSON.stringify(packet.payload.activity).includes("Copilot Sessions - Inbox")).length, 1);
+      assert.equal(sends.filter((packet) => JSON.stringify(packet.payload.activity).includes("uncertain-result-body")).length, 1);
+      assert.equal(sends.filter((packet) => JSON.stringify(packet.payload.activity).includes("acked-result-body")).length, 1);
+      assert.equal(combinedFailures, 0);
+    } finally { await bridge.close(); }
+  }, { acknowledgementMs: 300 });
 });
 
 test("relay sendResult definite rejection versus unknown connector outcome are distinguished and missing edits retain a recoverable 404", async (t) => {

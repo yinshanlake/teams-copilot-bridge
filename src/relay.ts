@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { io, type ManagerOptions, type Socket, type SocketOptions } from "socket.io-client";
 import type { ConversationReference } from "@microsoft/agents-activity";
 import type { Card, Outbound, Transport } from "./domain.js";
+import { block } from "./cards.js";
 import type { RelayBinding } from "./relay-config.js";
 import { MicrosoftSignInRequired, type RelayTokenSource } from "./relay-auth.js";
 import { allowedServiceUrl, outboundActivity, validateProactiveReference, validateTeamsOwnerActivity, type AuthorizedActivity, type TeamsIdentity } from "./teams.js";
@@ -370,13 +371,24 @@ export class RelayConnection implements Transport {
     validateProactiveReference(reference, this.identity);
     if (!this.connected) return Promise.reject(new DeliveryError("not-sent", "NOT_CONNECTED"));
     if (this.pending.size >= 32) return Promise.reject(new DeliveryError("not-sent", "LOCAL_BACKPRESSURE"));
+    let message = outbound;
+    if (outbound.type === "card" && outbound.summary) {
+      // The relay can split text+attachments and fail the single request ACK.
+      const summary = block(outbound.summary, {}, 1000);
+      const [first, ...rest] = outbound.card.body;
+      message = { type: "card", card: { ...outbound.card, body:
+        first?.type === "TextBlock" && typeof first.text === "string"
+          ? [{ ...first, text: first.text === summary.text ? first.text : `${summary.text}\n\n${first.text}` }, ...rest]
+          : [summary, ...outbound.card.body],
+      } };
+    }
     const requestId = randomUUID();
     const payload: Record<string, unknown> = {
       type: event, requestId, conversationId: reference.conversation.id,
       serviceUrl: reference.serviceUrl, tenantId: this.binding.aadTenantId,
       ...(event === "sendActivity" ? { recipient: reference.user } : { messageId }),
       ...(reference.conversation.name ? { conversationName: reference.conversation.name } : {}),
-      activity: outboundActivity(outbound),
+      activity: outboundActivity(message),
     };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

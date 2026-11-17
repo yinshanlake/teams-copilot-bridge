@@ -83,6 +83,14 @@ degrade without preventing startup. Thread-addressed work is retained for an
 explicit Routing-card choice; it is not silently forwarded to an old selection.
 The independent Inbox, current header, task/request cards and result previews use
 ordinary authenticated send/update messages, not a new relay protocol.
+Card activities are attachment-only on the relay: a bounded, redacted summary is
+kept in the first card TextBlock alongside the original heading, never sent as
+top-level `activity.text`/`textFormat` with an attachment. This avoids relays that
+split the combined form into separate messages without a reliable single ACK.
+Plain-text and history/XML envelopes, and webhook serialization, are unchanged.
+Only a correlated `sendResult.messageId` confirms delivery; `SEND_FAILED` remains
+uncertain even if a card is visible. Existing uncertain rows and surfaces are
+retained without retry or repost.
 
 An authenticated relay is trusted to represent the Bot service's inbound
 activity. It is an additional trust boundary, not a reason to skip the bridge's
