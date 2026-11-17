@@ -37,7 +37,7 @@ export class FakeRuntime implements Runtime {
   private listener: (event: RuntimeEvent) => void = () => { throw new Error("Mock runtime not started"); };
   private closed = false;
 
-  constructor(private readonly tickMs = 180, private readonly autonomous = true) {}
+  constructor(private readonly tickMs = 180, private readonly autonomous = true, private readonly interactionEvents = false) {}
 
   async start(listener: (event: RuntimeEvent) => void): Promise<void> {
     this.listener = listener;
@@ -108,6 +108,7 @@ export class FakeRuntime implements Runtime {
     session.busy = true;
     const messageId = randomUUID();
     session.origin = messageId;
+    if (this.interactionEvents) this.emit(id, "user.message", { messageId, content: text });
     this.emit(id, "assistant.turn_start", { turnId: randomUUID() });
     if (this.autonomous) {
       const generation = session.generation;

@@ -1,7 +1,7 @@
 {
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.23/MicrosoftTeams.schema.json",
   "manifestVersion": "1.23",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "id": "{{BOT_ID}}",
   "developer": {
     "name": "{{DEVELOPER_NAME}}",
@@ -35,9 +35,10 @@
             { "title": "!sessions", "description": "Find a main or side source, then !use its name or ID." },
             { "title": "!history", "description": "Read the latest ten meaningful messages. Optional count: 1 to 50." },
             { "title": "!status", "description": "Show the current source and notification status." },
-            { "title": "!subscribe", "description": "Receive future results from the exact selected source." },
-            { "title": "!unsubscribe", "description": "Stop that source's future subscription notifications." },
-            { "title": "!help", "description": "Show native chat and explicit ! command help." }
+            { "title": "!subscribe", "description": "Follow this exact source without expiry; capability is shown." },
+            { "title": "!unsubscribe", "description": "Mute passive notifications; explicit task replies still arrive." },
+            { "title": "!help", "description": "Show native chat and explicit ! command help." },
+            { "title": "!home", "description": "Open the Inbox without changing the next-message target." }
           ]
         }
       ]

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
-import type { Card } from "../src/domain.js";
+import type { Card, InteractionOptions } from "../src/domain.js";
 import { Bridge } from "../src/bridge.js";
 import { FakeRuntime } from "../src/fake-runtime.js";
 import { Store } from "../src/store.js";
@@ -37,11 +37,11 @@ export interface Harness {
 
 export async function harness(
   t: TestContext, autonomous = false, directory?: string,
-  options: { initializeConversation?: boolean; inventoryOnStart?: boolean; appLivenessTimeoutMs?: number; historyReadTimeoutMs?: number; deliveryInitiallyPaused?: boolean } = {},
+  options: { initializeConversation?: boolean; inventoryOnStart?: boolean; appLivenessTimeoutMs?: number; historyReadTimeoutMs?: number; deliveryInitiallyPaused?: boolean; interaction?: InteractionOptions } = {},
 ): Promise<Harness> {
   const path = directory ?? await temporary(t);
   const store = await Store.open(path, "test-owner");
-  const runtime = new FakeRuntime(2, autonomous);
+  const runtime = new FakeRuntime(2, autonomous, Boolean(options.interaction));
   const transport = new PreviewTransport();
   const bridge = new Bridge(store, runtime, transport, {
     owner: "test-owner", workspaces: [{ id: "local", name: "Test workspace", path }],
@@ -50,6 +50,7 @@ export async function harness(
     ...(options.appLivenessTimeoutMs === undefined ? {} : { appLivenessTimeoutMs: options.appLivenessTimeoutMs }),
     ...(options.historyReadTimeoutMs === undefined ? {} : { historyReadTimeoutMs: options.historyReadTimeoutMs }),
     ...(options.deliveryInitiallyPaused === undefined ? {} : { deliveryInitiallyPaused: options.deliveryInitiallyPaused }),
+    ...(options.interaction ? { interaction: options.interaction } : {}),
   });
   await bridge.start();
   const initial = authorizeActivity(mockEnvelope(), { aud: mockIdentity.appId }, mockIdentity);

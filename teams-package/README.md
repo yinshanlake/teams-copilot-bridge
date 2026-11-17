@@ -35,7 +35,9 @@ requests. The three files are at the ZIP root; do not wrap them in another folde
 Windows is required for PNG generation with `System.Drawing`.
 
 The manifest is version 1.23 and **personal-only**. Its menu contains
-`!sessions`, `!history`, `!status`, `!subscribe`, `!unsubscribe`, and `!help`.
+`!sessions`, `!history`, `!status`, `!subscribe`, `!unsubscribe`, `!help`, and `!home`.
+The package version defaults to 0.2.0 for the interaction-v3 Inbox/menu update.
+Newer prompt-starter fields are not added to the pinned 1.23 schema.
 Use `!use <name or ID>` in the chat to select a source. These are fixed bridge
 commands, not native Teams slash commands or an AI command parser.
 Old unprefixed titles such as `Home`, `Sessions`, and `Working` are literal work

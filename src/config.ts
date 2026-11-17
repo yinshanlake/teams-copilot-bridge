@@ -1,6 +1,6 @@
 import { isAbsolute, resolve } from "node:path";
 import { realpath, stat } from "node:fs/promises";
-import type { Workspace } from "./domain.js";
+import type { InteractionOptions, Workspace } from "./domain.js";
 import type { NativeOptions } from "./native.js";
 import type { TeamsIdentity } from "./teams.js";
 import { canonicalId, object, string, UserError } from "./safety.js";
@@ -13,6 +13,7 @@ interface CommonConfig {
   host: string;
   port: number;
   native: NativeOptions;
+  interaction: InteractionOptions;
 }
 
 export type Config = CommonConfig & (
@@ -73,8 +74,24 @@ export async function configuration(environment: NodeJS.ProcessEnv, cwd = proces
     workspaces.push({ id: workspace.id, name: workspace.name, path });
   }
   const native = nativeConfiguration(environment, stateDirectory, cwd);
-  const common = { identity: { appId, tenantId, ownerId, serviceHosts }, stateDirectory, workspaces, host: environment.BIND_HOST ?? "127.0.0.1", port, native };
+  const common = { identity: { appId, tenantId, ownerId, serviceHosts }, stateDirectory, workspaces, host: environment.BIND_HOST ?? "127.0.0.1", port, native,
+    interaction: interactionConfiguration(environment) };
   return relay ? { ...common, transport: "relay", relay } : { ...common, transport: "webhook", clientSecret: required(environment, "TEAMS_APP_SECRET") };
+}
+
+export function interactionConfiguration(environment: NodeJS.ProcessEnv): InteractionOptions {
+  const duration = (name: string, fallback: number, minimum: number, unit: number) => {
+    const value = Number(environment[name] ?? fallback);
+    if (!Number.isSafeInteger(value) || value < minimum || !Number.isSafeInteger(value * unit) || value * unit > 2_000_000_000) {
+      throw new UserError(`${name} must be an integer >= ${minimum} within the supported timer range.`);
+    }
+    return value * unit;
+  };
+  return {
+    statusUpdateMs: duration("BRIDGE_STATUS_UPDATE_SECONDS", 5, 2, 1000),
+    followMs: duration("BRIDGE_FOLLOW_HOURS", 24, 1, 3_600_000),
+    digestMs: 60_000,
+  };
 }
 
 export function botStateDirectory(environment: NodeJS.ProcessEnv, botAppId: string, cwd: string): string {

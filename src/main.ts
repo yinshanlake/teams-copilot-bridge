@@ -45,6 +45,7 @@ async function main(): Promise<void> {
     });
     bridge = new Bridge(store, new NativeRuntime(config.native), relay, {
       owner, workspaces: config.workspaces, coalesceMs: 1200, cardActions: "submit", deliveryInitiallyPaused: true,
+      interaction: config.interaction,
     });
     app = express();
     app.disable("x-powered-by");
@@ -57,6 +58,7 @@ async function main(): Promise<void> {
       adapter.continueConversation(config.identity.appId, reference, logic));
     bridge = new Bridge(store, new NativeRuntime(config.native), transport, {
       owner, workspaces: config.workspaces, coalesceMs: 1200, cardActions: "execute",
+      interaction: config.interaction,
     });
     app = createProductionApp(config.identity, config.clientSecret, adapter, bridge);
   }

@@ -92,7 +92,8 @@ export function outboundActivity(message: Outbound, id?: string): Activity {
     type: ActivityTypes.Message, ...(id ? { id } : {}),
     ...(message.type === "text"
       ? replyActivityFields(message)
-      : { attachments: [{ contentType: "application/vnd.microsoft.card.adaptive", content: message.card }] }),
+      : { ...(message.summary ? { text: message.summary, textFormat: "plain" } : {}),
+        attachments: [{ contentType: "application/vnd.microsoft.card.adaptive", content: message.card }] }),
   });
 }
 

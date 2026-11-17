@@ -33,11 +33,11 @@ function compareSessions(a: SessionRecord, b: SessionRecord, now: number): numbe
   return recentA === recentB ? a.id.localeCompare(b.id) : recentA > recentB ? -1 : 1;
 }
 
-function block(text: string, extra: Record<string, unknown> = {}, limit = 4000): Record<string, unknown> {
+export function block(text: string, extra: Record<string, unknown> = {}, limit = 4000): Record<string, unknown> {
   return { type: "TextBlock", text: safeText(text, limit), wrap: true, ...extra };
 }
 
-function card(body: Record<string, unknown>[], actions?: Record<string, unknown>[]): Card {
+export function card(body: Record<string, unknown>[], actions?: Record<string, unknown>[]): Card {
   return {
     type: "AdaptiveCard", version: "1.5", $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
     body, ...(actions ? { actions } : {}),
@@ -74,6 +74,14 @@ export function latestTranscriptPage(entries: TimelineEntry[]): number {
 }
 
 function notificationState(state: BridgeState, key: string, id: string): Record<string, unknown> {
+  const preference = state.interaction?.follows[digest(`${key}:${id}`)];
+  if (state.interaction) {
+    const subscription = state.subscriptions[digest(`${key}:${id}`)];
+    const active = preference && preference.mode !== "muted" && (preference.expiresAt === undefined || preference.expiresAt > Date.now());
+    const label = !active ? "Muted" : subscription?.enabled && subscription.status === "paused" ? "Following paused"
+      : preference.observation === "live" ? "Following - live only" : preference.observation === "unavailable" ? "Following unavailable" : "Following";
+    return block(`Notifications: ${label}`, { id: `notification-state-${id}`, size: "Default", weight: "Bolder", spacing: "Small" });
+  }
   const subscription = state.subscriptions[digest(`${key}:${id}`)];
   const active = subscription?.enabled && subscription.status === "watching";
   const paused = subscription?.enabled && subscription.status === "paused";
@@ -156,7 +164,12 @@ export function sessionListPage(state: BridgeState, conversation: ConversationRe
   sessions: SessionRecord[]; page: number; pages: number; total: number;
 } {
   const query = conversation.query?.trim().toLocaleLowerCase() ?? "";
-  const missing: SessionRecord[] = conversation.view === "subscriptions" ? Object.values(state.subscriptions)
+  const notificationSources = [...Object.values(state.subscriptions),
+    ...Object.values(state.interaction?.follows ?? {}).map((entry) => ({
+      ...entry, enabled: entry.mode !== "muted" && (entry.expiresAt === undefined || entry.expiresAt > now),
+    }))];
+  const uniqueNotifications = [...new Map(notificationSources.map((entry) => [entry.id, entry])).values()];
+  const missing: SessionRecord[] = conversation.view === "subscriptions" ? uniqueNotifications
     .filter((item) => item.enabled && item.conversationKey === conversation.key && !state.sessions[item.sessionId])
     .map((item) => ({
       id: item.sessionId, name: `Unavailable source ${item.sessionId.slice(0, 8)}`, kind: "unavailable", status: "offline",
@@ -166,7 +179,7 @@ export function sessionListPage(state: BridgeState, conversation: ConversationRe
   const sorted = [...Object.values(state.sessions), ...missing].filter((session) => session.kind !== "controller" &&
     (!query || session.name.toLocaleLowerCase().includes(query)) &&
     (conversation.view !== "sides" || session.sideChat?.parentId === conversation.sideParentId) &&
-    (conversation.view !== "subscriptions" || Object.values(state.subscriptions).some((item) =>
+    (conversation.view !== "subscriptions" || uniqueNotifications.some((item) =>
       item.conversationKey === conversation.key && item.sessionId === session.id && item.enabled)) &&
     (conversation.view !== "working" || isWorking(session, now)) &&
     (conversation.view !== "needs-reply" || hasPendingReply(session, now)))
@@ -213,6 +226,16 @@ export class Cards {
     private readonly cardActions: "submit" | "execute" = "submit",
   ) {}
 
+  scopedAction(conversation: ConversationRecord, title: string, scope: ActionScope, inputs = false): Record<string, unknown> {
+    return this.execute(conversation, title, scope, inputs);
+  }
+
+  requestSurface(conversation: ConversationRecord, target: SessionRecord, pending: PendingRequest): Card {
+    const body = [block(`${target.name} needs you`, { weight: "Bolder" }), block(target.id, { size: "Small" })];
+    this.request(body, conversation, target, pending);
+    return card(body, [this.execute(conversation, "Inbox", { op: "inbox" })]);
+  }
+
   render(state: BridgeState, key: string, models: ModelChoice[] = [], transcript?: TimelineEntry[], context: {
     previews?: ReadonlyMap<string, ConversationPreview>;
     connection?: "connected" | "ready" | "unavailable";
@@ -256,6 +279,9 @@ export class Cards {
         { size: "Small", color: control && readOnly ? "Attention" : "Default", isSubtle: true, spacing: "Small" }));
     }
     const subscription = target ? state.subscriptions[digest(`${key}:${target.id}`)] : undefined;
+    const follow = target ? state.interaction?.follows[digest(`${key}:${target.id}`)] : undefined;
+    const following = state.interaction ? Boolean(follow && follow.mode !== "muted" &&
+      (follow.expiresAt === undefined || follow.expiresAt > now)) : Boolean(subscription?.enabled);
     if (target && !control && !home && !list && conversation.view !== "new") {
       body.push(notificationState(state, key, target.id));
       body.push(block(target.id, { size: "Small", fontType: "Monospace" }));
@@ -512,7 +538,8 @@ export class Cards {
       execute("New session", { op: "view", argument: "new" }),
       execute("Subscriptions", { op: "view", argument: "subscriptions" }),
       ...(target && target.kind !== "controller" ? [
-        execute(subscription?.enabled ? "Unsubscribe" : "Subscribe", { op: subscription?.enabled ? "unsubscribe" : "subscribe", targetId: target.id }),
+        execute(state.interaction ? following ? "Mute" : "Follow" : subscription?.enabled ? "Unsubscribe" : "Subscribe",
+          { op: following ? "unsubscribe" : "subscribe", targetId: target.id }),
         ...(target.sideChat?.parentId && state.sessions[target.sideChat.parentId]
           ? [execute("Parent", { op: "select", targetId: target.sideChat.parentId })] : []),
         ...(!target.sideChat ? [execute("Side chats", { op: "view", argument: "sides", targetId: target.id })] : []),

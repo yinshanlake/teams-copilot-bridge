@@ -2,7 +2,8 @@
 
 A self-hosted, single-owner bridge between a **personal Microsoft Teams bot chat**
 and your local Copilot sessions. Use Teams' normal message composer to talk to an
-exact selected session, read its history, and opt into future-result notifications.
+explicit, visible Focus target. An Inbox, independently scoped task/request cards,
+and result previews keep control separate from work text.
 
 This is an independent project, not an official Microsoft or GitHub product.
 It is not a hosted service or a multi-user bot.
@@ -210,8 +211,9 @@ and the mobile client; no separate mobile sideload flow is promised.
 | `!use <name or ID>` | Select that exact source; use its canonical ID if names are ambiguous |
 | `!history` / `!history 20` | Read 10 messages by default, or an explicit count from 1 to 50 |
 | `!status` | Show the selected source and notification state |
-| `!subscribe` | Subscribe this personal chat to future results from exactly that readable local source |
-| `!unsubscribe` | Stop that source's passive notifications |
+| `!subscribe` | Follow the exact selected source without expiry; observation is journal-backed or explicitly live-only |
+| `!unsubscribe` | Mute passive notifications, not explicit task replies or outstanding receipts |
+| `!home` | Open the Inbox without changing the next-message target |
 | `!help` | Show commands and capabilities |
 
 Type ordinary work in Teams' native composer. Without a selected source, nothing
@@ -234,6 +236,42 @@ work. Native management peers without a correlatable message ID stay read-only.
 The included core preserves durable history/outbox formats: new complex-text
 messages use the v4 escaped basic-HTML/XML fallback, while already persisted
 legacy payloads are not rewritten or reposted.
+
+### Interaction v3
+
+The Inbox shows observed needs-you/running/recent-result state. App approval and
+question state remains **unknown** unless the original host exposes authoritative
+evidence; a busy heartbeat is not a permission request. Native request cards have
+their own signed surface, so changing focus or refreshing the Inbox does not
+invalidate another pending request.
+
+An accepted Teams task automatically follows that source for 24 hours, including
+after an earlier Mute. Explicit `!subscribe` has no expiry. App following uses the
+existing durable local cursor; owned SDK sessions are **live-only**, with no
+automatic reconnect or invented catch-up cursor. Existing paused subscriptions
+stay paused. Following capacity/failures are reported separately from the task's
+direct result obligation.
+
+Results first show a short preview and a **Show full** action. Full content is
+published through the existing measured chunk formatter as read-only history;
+it never resends work or changes the next-message target. A stable task-receipt
+reference supplies context without pretending to be a native server-stamped
+quote. Three or more passive source notifications within 60 seconds can form
+one digest; direct task replies are never folded into it. Individual passive
+notifications may wait for that collection window.
+
+`BRIDGE_STATUS_UPDATE_SECONDS` defaults to 5 (minimum 2); state transitions can
+update immediately. `BRIDGE_FOLLOW_HOURS` defaults to 24 (minimum 1). Values must
+fit the validated timer range. Rendering cards and following do not start an SDK.
+
+The Store now writes **schema 2**. Opening schema 1 validates the same owner and
+atomically preserves its sources, receipts, admissions, subscription cursors and
+all legacy outbox bytes/statuses. Old binaries reject schema 2. A controlled
+upgrade must stop the single writer and retain a consistent private backup.
+After any newly accepted work, restoring an older database is **not a safe
+rollback**: it can lose deduplication and receipt facts. Retain the schema-aware
+binary/state and review a forward fix or an explicit offline downgrade instead.
+See the [design and implementation record](docs/design/interaction-v3.md).
 
 ## Private state and operational limits
 

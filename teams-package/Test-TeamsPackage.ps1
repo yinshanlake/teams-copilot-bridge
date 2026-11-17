@@ -35,7 +35,7 @@ try {
         }
         $menu = $manifest.bots[0].commandLists[0]
         if (($menu.scopes -join ',') -ne 'personal' -or
-            ($menu.commands.title -join ',') -ne '!sessions,!history,!status,!subscribe,!unsubscribe,!help') {
+            ($menu.commands.title -join ',') -ne '!sessions,!history,!status,!subscribe,!unsubscribe,!help,!home') {
             throw 'The package must advertise the explicit ! command menu, never old unprefixed commands.'
         }
         foreach ($icon in @(@('outline.png', 32), @('color.png', 192))) {

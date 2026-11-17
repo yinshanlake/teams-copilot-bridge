@@ -5,7 +5,7 @@ import { Actions, isViewNavigation, StaleCardActionError, type ActionClaims } fr
 import { Cards, inputSuffix, latestTranscriptPage, sessionListPage } from "./cards.js";
 import type {
   Answer, AppAdmission, AppAdmissionSeed, BridgeOptions, Card, ConversationPreview, ConversationRecord, ModelChoice, Receipt, Runtime, RuntimeEvent,
-  SessionListView, SessionRecord, Settings, BridgeState, Subscription,
+  SessionListView, SessionRecord, Settings, BridgeState, Subscription, OutboxItem,
 } from "./domain.js";
 import { appAdmissionNotice, appSessionCapability, isSessionListView, viewTarget } from "./domain.js";
 import type { TimelineEntry } from "./domain.js";
@@ -16,6 +16,10 @@ import { conversationDialogue, sourceTitle } from "./conversation-ui.js";
 import { parseCommand, type Command } from "./commands.js";
 import { newMessageFormat } from "./transport-format.js";
 import { assertFields, canonicalId, DeliveryError, digest, logError, object, publicError, safeText, sessionName, string, UncertainOperationError, UserError } from "./safety.js";
+import {
+  followDescription, follows, inbox, interactionState, newSurface, observeInteraction, renderInteractionSurface,
+  setTurnState, startTurn, surfaceConversation, touchSurface, turnForOrigin,
+} from "./interaction.js";
 
 export type Incoming = { kind: "text"; text: string } | { kind: "action"; data: Record<string, unknown> };
 const workingCapability = "Bridge-owned native session: send/read/stop, mode/model/effort and scoped owner approvals.";
@@ -72,6 +76,8 @@ export class Bridge {
   private readonly directAcks = new Map<string, Promise<void>>();
   private readonly subscriptionReads = new Map<string, SubscriptionRead>();
   private readonly baselineReads = new Map<string, ReturnType<Runtime["subscriptionBaseline"]>>();
+  private interactionTimer: NodeJS.Timeout | undefined;
+  private readonly dashboardUpdates = new Map<string, { at: number; transition: string }>();
 
   constructor(
     readonly store: Store,
@@ -112,6 +118,7 @@ export class Bridge {
       });
     }
     await this.store.mutate((state) => {
+      if (this.options.interaction) interactionState(state);
       for (const conversation of Object.values(state.conversations)) conversation.surfaceId = randomUUID();
       for (const session of Object.values(state.sessions)) {
         if (session.kind === "owned" || session.kind === "controller") {
@@ -176,6 +183,7 @@ export class Bridge {
           key, reference, revision: 1, view: "home", page: 0, notice: "Choose a working session, or use Control.", surfaceId: randomUUID(),
           read: {},
         };
+        if (this.options.interaction) inbox(state, key);
       });
       const receiptId = digest(`${key}:${activityId}`);
       const existing = this.store.snapshot().receipts[receiptId];
@@ -190,8 +198,7 @@ export class Bridge {
       let livenessFailed = false;
       try {
         if (incoming.kind === "action") {
-          const conversation = this.store.snapshot().conversations[key]!;
-          const claims = this.actions.authenticate(incoming.data.token, conversation);
+          const claims = this.actions.authenticate(incoming.data.token, this.store.snapshot().conversations[key]!);
           operationName = claims.op;
           if (!isViewNavigation(claims) || claims.op === "refresh" || claims.op === "select" ||
             claims.op === "view" && claims.argument === "transcript") {
@@ -210,7 +217,7 @@ export class Bridge {
             }
             actionReceipt = nonceReceipt;
           }
-          this.actions.requireCurrent(claims, conversation);
+          this.actions.requireCurrent(claims, this.actionConversation(this.store.snapshot(), key, claims));
           if (actionReceipt) {
             await this.receipt(actionReceipt, key, claims.op, "started", "Card action validated.");
           }
@@ -247,6 +254,7 @@ export class Bridge {
         await this.reportOperationError(key, receiptId, detail, error instanceof StaleCardActionError);
       }
       await this.events;
+      if (this.options.interaction) await this.store.mutate((state) => { touchSurface(inbox(state, key), true); });
       if (operationName !== "unsubscribe") await this.loadPagePreviews(key);
       if (livenessFailed) await this.notice(key,
         `${livenessFailureNotice} ${this.store.snapshot().conversations[key]!.notice}`);
@@ -262,14 +270,45 @@ export class Bridge {
   render(key: string): Card {
     const state = this.store.snapshot();
     const conversation = state.conversations[key];
+    if (this.options.interaction && conversation && ["home", "working", "needs-reply"].includes(conversation.view)) {
+      return renderInteractionSurface(state, inbox(state, key), this.cards);
+    }
     const targetId = conversation ? viewTarget(state, conversation) : undefined;
-    return this.cards.render(state, key, this.modelCatalogues.get(targetId ?? "") ?? [],
+    const rendered = this.cards.render(state, key, this.modelCatalogues.get(targetId ?? "") ?? [],
       this.transcriptEntries(state.sessions[targetId ?? ""]), {
         previews: this.previews, previewFailures: this.previewFailures,
         discoveryStatus: this.runtime.discoveryStatus(),
         connection: !this.healthy || this.transport.connected === false ? "unavailable"
           : this.transport.connected === true ? "connected" : "ready",
       });
+    if (this.options.interaction && conversation?.view === "dashboard" && conversation.selectedId) {
+      rendered.body.splice(1, 0,
+        { type: "TextBlock", text: `Next message -> ${safeText(state.sessions[conversation.selectedId]?.name ?? conversation.selectedId, 120)}`, wrap: true, weight: "Bolder" },
+        { type: "TextBlock", text: followDescription(state, key, conversation.selectedId), wrap: true, size: "Small" });
+      rendered.actions = [...(rendered.actions ?? []), this.cards.scopedAction(conversation, "Change next target", { op: "view", argument: "sessions" })];
+      if (Buffer.byteLength(JSON.stringify(rendered)) > 27_000) {
+        rendered.body = [
+          { type: "TextBlock", text: `Next message -> ${safeText(state.sessions[conversation.selectedId]?.name ?? conversation.selectedId, 120)}`, wrap: true, weight: "Bolder" },
+          { type: "TextBlock", text: followDescription(state, key, conversation.selectedId), wrap: true },
+          { type: "TextBlock", text: "Details exceed Teams' card budget. Pending requests have separately scoped cards; use History for source content.", wrap: true },
+        ];
+        rendered.actions = [
+          this.cards.scopedAction(conversation, "Change next target", { op: "view", argument: "sessions" }),
+          this.cards.scopedAction(conversation, "History", { op: "view", argument: "transcript", targetId: conversation.selectedId }),
+          this.cards.scopedAction(conversation, "Inbox", { op: "view", argument: "home" }),
+        ];
+      }
+    }
+    return rendered;
+  }
+
+  private actionConversation(state: BridgeState, key: string, claims: ActionClaims): ConversationRecord {
+    if (claims.version === 1) return state.conversations[key]!;
+    const surface = state.interaction?.surfaces[claims.surfaceId ?? ""];
+    if (!surface || surface.conversationKey !== key || surface.frozen) {
+      throw new StaleCardActionError("This interaction card was replaced or resolved. Use the latest Inbox.");
+    }
+    return surfaceConversation(state, surface);
   }
 
   private async loadPagePreviews(key: string): Promise<void> {
@@ -368,6 +407,8 @@ export class Bridge {
         receipt.detail = appAdmissionNotice(admission);
       }
       state.admissions[admission.id] = admission;
+      const turn = state.interaction?.turns[receiptIds[0] ?? ""];
+      if (turn) { turn.messageId = seed.messageId; setTurnState(state, turn, "accepted"); }
       for (const item of state.outbox) if (item.sessionId === sessionId && item.conversationKey === key &&
         item.originatingMessageId === seed.messageId) {
         item.admissionId = admission.id;
@@ -491,6 +532,10 @@ export class Bridge {
   }
 
   private async showSessions(key: string, fresh: boolean, preservePage = false, view: SessionListView = "sessions"): Promise<void> {
+    if (this.options.interaction && (view === "working" || view === "needs-reply")) {
+      await this.showHome(key, fresh);
+      return;
+    }
     if (!preservePage || this.store.snapshot().conversations[key]!.view !== view) {
       await this.setView(key, view);
     } else {
@@ -516,6 +561,7 @@ export class Bridge {
 
   private async showHome(key: string, fresh: boolean): Promise<void> {
     await this.setView(key, "home");
+    if (this.options.interaction) await this.store.mutate((state) => { touchSurface(inbox(state, key, fresh), true); });
     if (fresh) await this.freshReply(key, "Choose a working session, or use Control.");
     this.startCatalogueRefresh();
   }
@@ -560,7 +606,7 @@ export class Bridge {
       if (view === "transcript" && transcriptId) {
         if (!state.sessions[transcriptId]) throw new UserError("Target is not in the current session catalogue.");
         conversation.transcriptId = transcriptId;
-        if (transcriptId !== state.controllerId) conversation.selectedId = transcriptId;
+        if (transcriptId !== state.controllerId && !this.options.interaction) conversation.selectedId = transcriptId;
       }
       conversation.view = view;
       conversation.page = view === "transcript"
@@ -577,13 +623,43 @@ export class Bridge {
   }
 
   private async action(key: string, claims: ActionClaims, data: Record<string, unknown>, receiptIds: string[]): Promise<void> {
-    const conversation = this.store.snapshot().conversations[key]!;
+    const conversation = this.actionConversation(this.store.snapshot(), key, claims);
     const targetId = viewTarget(this.store.snapshot(), conversation);
+    if (this.options.interaction && ["subscribe", "unsubscribe", "follow", "mute"].includes(claims.op)) {
+      assertFields(data, ["token"]);
+      if (!canonicalId(claims.targetId) || claims.targetId !== targetId && conversation.view !== "subscriptions") {
+        throw new UserError("Following target does not match this signed source.");
+      }
+      await this.changeFollow(key, claims.targetId,
+        claims.op === "unsubscribe" || claims.op === "mute" ? "muted" : "explicit", claims);
+      return;
+    }
     if (claims.view === "sides" && ["page", "filter", "refresh"].includes(claims.op)) {
       if (!canonicalId(claims.targetId) || !this.store.snapshot().sessions[claims.targetId]) throw new UserError("This side-chat list has no signed canonical parent.");
       await this.store.mutate((state) => { state.conversations[key]!.sideParentId = claims.targetId!; });
     }
     switch (claims.op) {
+      case "inbox":
+        assertFields(data, ["token"]);
+        await this.showHome(key, claims.argument !== "refresh");
+        return;
+      case "open-source":
+        assertFields(data, ["token"]);
+        if (!canonicalId(claims.targetId)) throw new UserError("Choose a canonical source.");
+        await this.requestHistory(key, claims.targetId, 10, receiptIds, true);
+        return;
+      case "history-source":
+        assertFields(data, ["token"]);
+        if (!canonicalId(claims.targetId)) throw new UserError("Choose a canonical source.");
+        await this.requestHistory(key, claims.targetId, 10, receiptIds, false, true);
+        return;
+      case "show-full":
+        assertFields(data, ["token"]);
+        await this.showFullResult(key, claims, receiptIds);
+        return;
+      case "follow":
+      case "mute":
+        throw new UserError("This interaction is not enabled.");
       case "subscribe":
       case "unsubscribe": {
         assertFields(data, ["token"]);
@@ -654,7 +730,7 @@ export class Bridge {
           const id = claims.targetId ?? targetId;
           if (!id) throw new UserError("Choose a source with !sessions or !use before reading history.");
           if (id === this.store.snapshot().controllerId) await this.showTranscript(key, id);
-          else await this.requestHistory(key, id, 10, receiptIds, true);
+          else await this.requestHistory(key, id, 10, receiptIds, !this.options.interaction, Boolean(this.options.interaction));
           return;
         }
         await this.setView(key, view);
@@ -857,6 +933,13 @@ export class Bridge {
           if (command.name === "subscribe" && conversation.selectionBlocked) throw new UserError("Destination unresolved. Choose a valid source with !use before subscribing.");
           await this.setView(key, "dashboard");
           const current = this.store.snapshot().conversations[key]!;
+          if (this.options.interaction) {
+            const claims = this.actions.verify(this.actions.issue(current, {
+              op: command.name, targetId: current.selectedId!,
+            }), current);
+            await this.action(key, claims, { token: "internal-fixed-command" }, receiptIds);
+            return;
+          }
           const subscription = this.store.snapshot().subscriptions[digest(`${key}:${current.selectedId}`)];
           if (command.name === "subscribe" && subscription?.enabled) {
             await this.notice(key, subscription.status === "paused"
@@ -976,7 +1059,13 @@ export class Bridge {
           if (oldest) delete state.directOrigins[oldest.id];
         }
         state.directOrigins[originId] = { id: originId, sessionId: id, conversationKey: key, status: "admitting", at: Date.now() };
+        if (this.options.interaction) startTurn(state, key, id, originId);
       });
+      gate = new Promise<void>((resolve) => { acknowledge = resolve; });
+      this.directAcks.set(id, gate);
+    }
+    if (!gate && this.options.interaction) {
+      await this.store.mutate((state) => { startTurn(state, key, id, originId); });
       gate = new Promise<void>((resolve) => { acknowledge = resolve; });
       this.directAcks.set(id, gate);
     }
@@ -987,17 +1076,24 @@ export class Bridge {
         ? (seed) => this.persistAppAdmission(key, id, receiptIds, seed) : undefined);
       accepted = true;
       if (gate) await this.store.mutate((state) => {
-        const origin = state.directOrigins[originId]!;
-        origin.messageId = result.id; origin.status = "accepted";
+        const origin = state.directOrigins[originId];
+        if (origin) { origin.messageId = result.id; origin.status = "accepted"; }
+        const turn = state.interaction?.turns[originId];
+        if (turn) { turn.messageId = result.id; setTurnState(state, turn, "accepted"); }
       });
     } catch (error) {
-      if (gate && !accepted) await this.store.mutate((state) => { state.directOrigins[originId]!.status = "failed"; });
+      if (gate) await this.store.mutate((state) => {
+        if (!accepted && state.directOrigins[originId]) state.directOrigins[originId]!.status = "failed";
+        const turn = state.interaction?.turns[originId];
+        if (turn) setTurnState(state, turn, accepted || error instanceof UncertainOperationError ? "uncertain" : "failed");
+      });
       if (accepted) throw new UncertainOperationError("Task may be accepted but direct-response binding could not be persisted. No replay was attempted.");
       throw error;
     } finally {
       acknowledge?.();
       if (this.directAcks.get(id) === gate) this.directAcks.delete(id);
     }
+    if (this.options.interaction) await this.changeFollow(key, id, "automatic");
     if (result.peer && target.peerSource === "app") {
       if (!this.store.snapshot().admissions[digest(`${id}:${result.id}`)]) {
         throw new UncertainOperationError("App host may have accepted, but no durable admission checkpoint exists. Execution/result are unconfirmed and no task will be replayed.");
@@ -1059,6 +1155,172 @@ export class Bridge {
     });
   }
 
+  private async changeFollow(
+    key: string, sessionId: string, mode: "automatic" | "explicit" | "muted", claims?: ActionClaims,
+  ): Promise<void> {
+    const options = this.options.interaction;
+    if (!options) throw new UserError("Following is not enabled.");
+    const id = digest(`${key}:${sessionId}`);
+    const before = this.store.snapshot();
+    const previous = before.interaction?.follows[id];
+    if (mode === "automatic" && previous?.mode === "explicit") return;
+    let cursor: Awaited<ReturnType<Runtime["subscriptionBaseline"]>> | undefined;
+    let observation = previous?.observation ?? "unavailable";
+    let detail = "Muted. Explicit task replies and pending request cards are not cancelled.";
+    let failure: unknown;
+    if (mode !== "muted") {
+      const source = before.sessions[sessionId];
+      if (!source || source.kind === "controller" || source.access?.read === false) {
+        failure = new UserError("This source has no readable following route.");
+      } else if (before.subscriptions[id]?.enabled) {
+        observation = "journal";
+        detail = before.subscriptions[id]!.detail;
+      } else if (source.peerSource === "app") {
+        try {
+          if (Object.values(before.subscriptions).filter((entry) => entry.enabled).length >= 8 ||
+            !before.subscriptions[id] && Object.keys(before.subscriptions).length >= 64) {
+            throw new UserError("Journal following capacity reached; explicit task replies remain enabled.");
+          }
+          cursor = await this.captureSubscriptionBaseline(sessionId);
+          observation = "journal";
+          detail = "Following from now. Earlier results are not replayed.";
+        } catch (error) {
+          failure = error;
+        }
+      } else if (source.kind === "owned") {
+        observation = "live";
+        detail = "Live connection only. No durable catch-up or automatic SDK reconnect.";
+      } else failure = new UserError("This host has no supported passive observer. Use History; no SDK was started.");
+      if (failure) {
+        logError("following-unavailable", failure);
+        observation = "unavailable";
+        detail = publicError(failure);
+      }
+    }
+    await this.store.mutate((state) => {
+      if (claims) this.actions.requireCurrent(claims, this.actionConversation(state, key, claims));
+      const ui = interactionState(state);
+      const existing = ui.follows[id];
+      if (mode === "automatic" && existing?.mode === "explicit") return;
+      const revision = existing && existing.mode !== "muted" && mode !== "muted" ? existing.revision : (existing?.revision ?? 0) + 1;
+      ui.follows[id] = {
+        id, conversationKey: key, sessionId, revision, mode, observation, detail,
+        ...(mode === "automatic" ? { expiresAt: Date.now() + options.followMs } : {}),
+      };
+      if (cursor) {
+        if (state.subscriptions[id]?.enabled) {
+          ui.follows[id]!.detail = state.subscriptions[id]!.detail;
+        } else {
+          if (Object.values(state.subscriptions).filter((entry) => entry.enabled).length >= 8 ||
+            !state.subscriptions[id] && Object.keys(state.subscriptions).length >= 64) {
+            ui.follows[id]!.observation = "unavailable";
+            ui.follows[id]!.detail = "Following capacity changed. Explicit task replies remain enabled.";
+          } else state.subscriptions[id] = {
+            id, sessionId, conversationKey: key, revision: (state.subscriptions[id]?.revision ?? 0) + 1,
+            enabled: true, status: "watching", cursor, detail,
+          };
+        }
+      }
+      if (mode === "muted") {
+        const subscription = state.subscriptions[id];
+        if (subscription) {
+          subscription.enabled = false; subscription.status = "disabled"; subscription.revision++;
+          subscription.detail = detail;
+        }
+        for (const item of state.outbox) if (!item.direct && !item.admissionId && item.status === "pending" &&
+          (item.follow?.id === id || item.subscription?.id === id)) {
+          item.status = "cancelled"; item.detail = "Muted before passive delivery.";
+        }
+      }
+      state.conversations[key]!.notice = followDescription(state, key, sessionId);
+      touchSurface(inbox(state, key), true);
+      for (const surface of Object.values(ui.surfaces)) if (surface.conversationKey === key && surface.sessionId === sessionId) {
+        touchSurface(surface, true);
+      }
+    });
+    this.armSubscriptions();
+    this.armInteractionWake();
+    this.schedule(key);
+    if (failure && mode === "explicit") throw new UserError(detail);
+  }
+
+  private async expireFollows(): Promise<void> {
+    if (!this.options.interaction) return;
+    const expired = Object.values(this.store.snapshot().interaction?.follows ?? {}).filter((entry) =>
+      entry.mode === "automatic" && entry.expiresAt !== undefined && entry.expiresAt <= Date.now());
+    if (!expired.length) return;
+    await this.store.mutate((state) => {
+      for (const prior of expired) {
+        const current = state.interaction?.follows[prior.id];
+        if (!current || current.revision !== prior.revision || current.mode !== "automatic") continue;
+        current.mode = "muted"; current.revision++;
+        current.detail = "Automatic following expired. Explicit task replies remain enabled.";
+        const subscription = state.subscriptions[prior.id];
+        if (subscription) {
+          subscription.enabled = false; subscription.status = "disabled"; subscription.revision++;
+          subscription.detail = current.detail;
+        }
+        for (const item of state.outbox) if (!item.direct && !item.admissionId && item.status === "pending" &&
+          (item.follow?.id === prior.id || item.subscription?.id === prior.id)) {
+          item.status = "cancelled"; item.detail = current.detail;
+        }
+        touchSurface(inbox(state, prior.conversationKey), true);
+      }
+    });
+    for (const entry of expired) this.schedule(entry.conversationKey);
+  }
+
+  private async showFullResult(key: string, claims: ActionClaims, receiptIds: string[]): Promise<void> {
+    await this.store.mutate((state) => {
+      this.actions.requireCurrent(claims, this.actionConversation(state, key, claims));
+      const item = state.outbox.find((entry) => entry.id === claims.argument && entry.publication);
+      if (!item || item.conversationKey !== key || item.sessionId !== claims.targetId) throw new UserError("This result does not belong to this card.");
+      if (Buffer.byteLength(item.text) > 128_000) throw new UserError("This full result exceeds the bounded history group. Read it in the original host; no text was truncated.");
+      this.supersedeHistory(state, key);
+      const id = digest(`full:${key}:${item.id}:${receiptIds[0]}`);
+      const chunks = replyChunks(item.text, {
+        version: 4, title: item.publication!.title, sourceId: item.sessionId, kind: "history", groupId: id,
+        format: newMessageFormat(item.publication!.title + "\n" + item.text) === "plain" ? "xml" : "markdown",
+      });
+      state.conversations[key]!.historyRead = {
+        id, sessionId: item.sessionId, count: 1, receiptIds, status: "queued", readOnlyTarget: true,
+      };
+      for (const [index, chunk] of chunks.entries()) state.outbox.push({
+        id: digest(`history:${key}:${item.sessionId}:${id}:${index}`), conversationKey: key, sessionId: item.sessionId,
+        eventId: `history:${id}`, historyId: id, ...chunk, status: "pending",
+      });
+      for (const receiptId of receiptIds) {
+        const receipt = state.receipts[receiptId]!;
+        receipt.operation = "history"; receipt.status = "applied";
+        receipt.detail = "Full result queued once as read-only history. The next-message target is unchanged.";
+      }
+    });
+  }
+
+  private armInteractionWake(): void {
+    if (!this.options.interaction || this.closing) return;
+    if (this.interactionTimer) clearTimeout(this.interactionTimer);
+    this.interactionTimer = undefined;
+    const state = this.store.snapshot();
+    const now = Date.now();
+    const times = [
+      ...Object.values(state.interaction?.follows ?? {}).flatMap((entry) =>
+        entry.mode === "automatic" && entry.expiresAt !== undefined ? [entry.expiresAt] : []),
+      ...Object.values(state.interaction?.surfaces ?? {}).flatMap((surface) =>
+        surface.delivery === "ready" && surface.renderedVersion !== surface.version
+          ? [Math.max(surface.retryAt ?? 0, (surface.lastUpdatedAt ?? 0) + this.options.interaction!.statusUpdateMs)] : []),
+      ...state.outbox.flatMap((item) => item.status === "pending" && item.publication && !item.direct && !item.admissionId && !item.digestId
+        ? [(item.createdAt ?? now) + (this.options.interaction!.digestMs ?? 60_000)] : []),
+    ];
+    if (!times.length) return;
+    const next = times.reduce((earliest, time) => Math.min(earliest, time), Infinity);
+    this.interactionTimer = setTimeout(() => {
+      this.interactionTimer = undefined;
+      for (const key of Object.keys(this.store.snapshot().conversations)) this.schedule(key);
+    }, Math.max(10, Math.min(2_000_000_000, next - now)));
+    this.interactionTimer.unref();
+  }
+
   private supersedeHistory(state: BridgeState, key: string): boolean {
     const previous = state.conversations[key]!.historyRead;
     if (!previous) return false;
@@ -1081,12 +1343,13 @@ export class Bridge {
 
   private currentHistory(key: string, id: string, sessionId: string): boolean {
     const conversation = this.store.snapshot().conversations[key];
-    return !this.closing && !conversation?.selectionBlocked && conversation?.selectedId === sessionId &&
+    return !this.closing && (conversation?.historyRead?.readOnlyTarget === true ||
+      !conversation?.selectionBlocked && conversation?.selectedId === sessionId) &&
       conversation.historyRead?.id === id && conversation.historyRead.sessionId === sessionId &&
       conversation.historyRead.status === "reading";
   }
 
-  private async requestHistory(key: string, sessionId: string, count: number, receiptIds: string[], select: boolean): Promise<void> {
+  private async requestHistory(key: string, sessionId: string, count: number, receiptIds: string[], select: boolean, readOnlyTarget = false): Promise<void> {
     if (select) await this.store.mutate((state) => { state.conversations[key]!.selectionBlocked = true; });
     const target = this.store.snapshot().sessions[sessionId];
     if (!canonicalId(sessionId) || !target || target.kind === "controller") throw new UserError("Choose a known working source with !sessions or !use.");
@@ -1102,16 +1365,17 @@ export class Bridge {
     try {
       await this.store.mutate((state) => {
         const conversation = state.conversations[key]!;
-        if (!select && conversation.selectedId !== sessionId) throw new UserError("History source changed. Request !history again.");
+        if (!select && !readOnlyTarget && conversation.selectedId !== sessionId) throw new UserError("History source changed. Request !history again.");
         const superseded = this.supersedeHistory(state, key);
-        conversation.selectedId = sessionId;
+        if (!readOnlyTarget) conversation.selectedId = sessionId;
         if (select) conversation.selectionBlocked = false;
-        conversation.historyRead = { id, sessionId, count, receiptIds, status: "reading", ...(superseded ? { superseded } : {}) };
+        conversation.historyRead = { id, sessionId, count, receiptIds, status: "reading", ...(superseded ? { superseded } : {}),
+          ...(readOnlyTarget ? { readOnlyTarget: true } : {}) };
         conversation.view = "dashboard";
         conversation.page = 0;
         conversation.revision++;
         conversation.read[sessionId] = state.sessions[sessionId]!.sequence;
-        conversation.notice = `${superseded ? "Previous history superseded. " : ""}Selected ${safeText(target.name, 100)}. Reading up to ${count} meaningful messages; no task was sent.`;
+        conversation.notice = `${superseded ? "Previous history superseded. " : ""}${readOnlyTarget ? "Reading" : "Selected"} ${safeText(target.name, 100)}. Reading up to ${count} meaningful messages; no task was sent.${readOnlyTarget ? " Next-message target is unchanged." : ""}`;
         for (const receiptId of receiptIds) {
           const receipt = state.receipts[receiptId];
           if (!receipt || receipt.conversationKey !== key) throw new Error("Missing history intent receipt.");
@@ -1159,7 +1423,7 @@ export class Bridge {
       await this.store.mutate((state) => {
         const conversation = state.conversations[key]!;
         const intent = conversation.historyRead;
-        if (conversation.selectionBlocked || conversation.selectedId !== sessionId || intent?.id !== id ||
+        if ((!intent?.readOnlyTarget && (conversation.selectionBlocked || conversation.selectedId !== sessionId)) || intent?.id !== id ||
           intent.sessionId !== sessionId || intent.status !== "reading") return;
         const chunks = replyChunks(text, { version: 4, kind: "history", title,
           sourceId: sessionId, format: format === "plain" ? "xml" : "markdown", groupId: id });
@@ -1185,7 +1449,7 @@ export class Bridge {
       const receiptIds = await this.store.mutate((state) => {
         const conversation = state.conversations[key];
         const intent = conversation?.historyRead;
-        if (!conversation || conversation.selectionBlocked || conversation.selectedId !== sessionId ||
+        if (!conversation || (!intent?.readOnlyTarget && (conversation.selectionBlocked || conversation.selectedId !== sessionId)) ||
           intent?.id !== id || intent.sessionId !== sessionId || intent.status !== "reading") return [];
         intent.status = "failed";
         for (const receiptId of intent.receiptIds) {
@@ -1313,6 +1577,10 @@ export class Bridge {
         return false;
       }
       const result = this.projector.apply(session, incoming.event, incoming.historical);
+      if (this.options.interaction && !incoming.historical && object(incoming.event) && incoming.event.type === "session.error" &&
+        !incoming.event.agentId) {
+        result.final = { id: `error:${incoming.event.id}`, text: "The source reported an error. Inspect its original host for details. No task was retried." };
+      }
       if (result.final && object(incoming.event) && object(incoming.event.data) && typeof incoming.event.data.sourceResultKey === "string") {
         const sourceResultKey = incoming.event.data.sourceResultKey;
         const existing = state.outbox.find((item) => item.sessionId === session.id && item.sourceResultKey === sourceResultKey);
@@ -1357,6 +1625,7 @@ export class Bridge {
         }
         if (admission.phase === "confirmed") settledAdmissionId = admission.id;
       }
+      if (this.options.interaction) observeInteraction(state, incoming);
       if (!result.changed && !admissionChanged) return false;
       for (const conversation of Object.values(state.conversations)) {
         const viewing = viewTarget(state, conversation) === session.id;
@@ -1369,10 +1638,13 @@ export class Bridge {
           item.sessionId === session.id && item.conversationKey === conversation.key && item.status === "accepted" && item.messageId === nativeOrigin);
         const receives = admission ? admission.conversationKey === conversation.key :
           session.kind === "controller" ? this.activeControlKey === conversation.key : Boolean(direct);
-        if (receives && result.final && !incoming.historical) {
+        const passive = this.options.interaction && session.kind === "owned"
+          ? follows(state, conversation.key, session.id) : undefined;
+        if ((receives || passive?.observation === "live") && result.final && !incoming.historical) {
           if (direct) direct.answered = true;
           this.enqueueFinal(state, conversation.key, session.id, result.final, {
-            direct: true, ...(admission ? { admissionId: admission.id } : {}),
+            direct: receives, ...(admission ? { admissionId: admission.id } : {}),
+            ...(!receives && passive ? { follow: { id: passive.id, revision: passive.revision } } : {}),
             ...(typeof nativeOrigin === "string" ? { originatingMessageId: nativeOrigin } : {}),
             ...(object(incoming.event) && object(incoming.event.data) && typeof incoming.event.data.sourceResultKey === "string"
               ? { sourceResultKey: incoming.event.data.sourceResultKey } : {}),
@@ -1394,7 +1666,7 @@ export class Bridge {
   }
 
   private enqueueFinal(state: BridgeState, key: string, sessionId: string, final: { id: string; text: string },
-    claim: { direct: boolean; admissionId?: string; originatingMessageId?: string; sourceResultKey?: string; subscription?: { id: string; revision: number } }): void {
+    claim: { direct: boolean; admissionId?: string; originatingMessageId?: string; sourceResultKey?: string; subscription?: { id: string; revision: number }; follow?: { id: string; revision: number } }): void {
     const session = state.sessions[sessionId];
     const conversation = state.conversations[key];
     if (!session || !conversation) throw new Error("Missing canonical final destination.");
@@ -1403,11 +1675,25 @@ export class Bridge {
     if (existing.length) {
       for (const item of existing) {
         if (claim.direct) {
+          if (item.digestId) this.releasePendingDigest(state, item.digestId);
           item.direct = true;
           if (claim.admissionId) item.admissionId = claim.admissionId;
           if (item.status === "cancelled") item.status = "pending";
         }
       }
+      return;
+    }
+    if (this.options.interaction && session.kind !== "controller") {
+      const id = digest(`${key}:${sessionId}:${final.id}:0`);
+      const origin = claim.originatingMessageId ?? (claim.admissionId ? state.admissions[claim.admissionId]?.messageId : undefined);
+      const turn = turnForOrigin(state, sessionId, origin);
+      const surface = newSurface(state, key, "result", { sessionId, outboxId: id, ...(turn ? { turnId: turn.id } : {}) });
+      state.outbox.push({
+        id, conversationKey: key, sessionId, eventId: final.id, text: final.text,
+        status: "pending", createdAt: Date.now(), ...claim,
+        publication: { version: 1, title: safeText(sourceTitle(session, state.sessions), 440), surfaceId: surface.id },
+        ...(claim.direct && turn ? { originReference: structuredClone(turn.reference) } : {}),
+      });
       return;
     }
     const chunks = replyChunks(final.text, { version: 4, title: safeText(sourceTitle(session, state.sessions), 440),
@@ -1451,6 +1737,7 @@ export class Bridge {
   async checkSubscriptions(): Promise<void> {
     if (this.subscriptionCheck) return this.subscriptionCheck;
     const run = async () => {
+      await this.expireFollows();
       const subscriptions = Object.values(this.store.snapshot().subscriptions).filter((item) => item.enabled && item.status === "watching");
       for (let offset = 0; offset < subscriptions.length && !this.closing; offset += 2) {
         await Promise.all(subscriptions.slice(offset, offset + 2).map(async (subscription) => {
@@ -1490,6 +1777,7 @@ export class Bridge {
             return;
           } finally { if (deadline) clearTimeout(deadline); }
           if (this.closing) return;
+          await this.directAcks.get(subscription.sessionId);
           await this.store.mutate((state) => {
             const current = state.subscriptions[subscription.id];
             const session = state.sessions[subscription.sessionId];
@@ -1540,20 +1828,145 @@ export class Bridge {
     this.timer.unref();
   }
 
+  private passiveEligible(state: BridgeState, item: OutboxItem): boolean {
+    if (item.direct || item.admissionId) return true;
+    if (item.follow) {
+      const current = follows(state, item.conversationKey, item.sessionId);
+      if (!current || current.id !== item.follow.id || current.revision !== item.follow.revision) return false;
+    }
+    if (item.subscription) {
+      const current = state.subscriptions[item.subscription.id];
+      if (!current?.enabled || current.revision !== item.subscription.revision) return false;
+    }
+    return true;
+  }
+
+  private releasePendingDigest(state: BridgeState, id: string): void {
+    const digestItem = state.outbox.find((entry) => entry.id === id);
+    if (!digestItem?.digest || digestItem.status !== "pending") return;
+    digestItem.status = "cancelled";
+    digestItem.detail = "Unclaimed digest membership changed; no send was attempted.";
+    for (const memberId of digestItem.digest.memberIds) {
+      const member = state.outbox.find((entry) => entry.id === memberId);
+      if (member?.status === "pending") delete member.digestId;
+    }
+  }
+
+  private async prepareDigests(key: string): Promise<void> {
+    await this.store.mutate((state) => {
+      const candidates = state.outbox.filter((item) => item.conversationKey === key && item.status === "pending" &&
+        item.publication && !item.direct && !item.admissionId && !item.digestId && this.passiveEligible(state, item))
+        .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+      const first = candidates[0];
+      if (!first) return;
+      const members = candidates.filter((item) =>
+        (item.createdAt ?? 0) <= (first.createdAt ?? 0) + (this.options.interaction?.digestMs ?? 60_000)).slice(0, 64);
+      if (new Set(members.map((item) => item.sessionId)).size < 3) return;
+      const id = digest(`digest:${key}:${members.map((item) => item.id).join(":")}`);
+      if (state.outbox.some((item) => item.id === id)) return;
+      const surface = newSurface(state, key, "digest", { outboxId: id });
+      state.outbox.push({
+        id, conversationKey: key, sessionId: first.sessionId, eventId: `digest:${id}`,
+        text: "Followed sessions have new replies.", status: "pending", createdAt: Date.now(),
+        digest: { version: 1, memberIds: members.map((item) => item.id), surfaceId: surface.id },
+      });
+      for (const member of members) member.digestId = id;
+    });
+  }
+
+  private async deliverInteractionSurfaces(key: string): Promise<void> {
+    const options = this.options.interaction;
+    if (!options) return;
+    const state = this.store.snapshot();
+    const surfaces = Object.values(state.interaction?.surfaces ?? {}).filter((surface) =>
+      surface.conversationKey === key && surface.renderedVersion !== surface.version &&
+      (surface.delivery === "ready" || surface.delivery === "pending" && surface.kind !== "result" && surface.kind !== "digest") &&
+      (!surface.frozen || surface.activityId));
+    for (const surface of surfaces) {
+      if ((surface.retryAt ?? 0) > Date.now() ||
+        surface.activityId && !surface.urgent && Date.now() < (surface.lastUpdatedAt ?? 0) + options.statusUpdateMs) continue;
+      const snapshot = this.store.snapshot();
+      const current = snapshot.interaction?.surfaces[surface.id];
+      if (!current || current.delivery !== surface.delivery || current.renderedVersion === current.version) continue;
+      const reference = snapshot.interaction?.turns[current.turnId ?? ""]?.reference ?? snapshot.conversations[key]!.reference;
+      const body = renderInteractionSurface(snapshot, current, this.cards);
+      if (Buffer.byteLength(JSON.stringify(body)) > 27_000) {
+        await this.notice(key, "A detailed interaction card exceeds Teams' size limit. Use !status or !history; no action was approved.");
+        await this.store.mutate((draft) => { draft.interaction!.surfaces[current.id]!.delivery = "rejected"; });
+        continue;
+      }
+      if (!current.activityId) await this.store.mutate((draft) => { draft.interaction!.surfaces[current.id]!.delivery = "sending"; });
+      try {
+        const activityId = current.activityId;
+        const sentId = activityId ? (await this.transport.update(reference, activityId, body), activityId)
+          : await this.transport.send(reference, { type: "card", card: body,
+            summary: current.kind === "request" ? `${snapshot.sessions[current.sessionId ?? ""]?.name ?? "Copilot"} needs your response.`
+              : current.kind === "turn" ? "Copilot task receipt - acceptance and progress are separate." : "Copilot Sessions Inbox" });
+        await this.store.mutate((draft) => {
+          const saved = draft.interaction!.surfaces[current.id]!;
+          saved.activityId = sentId; saved.delivery = "ready";
+          saved.renderedVersion = current.version; saved.lastUpdatedAt = Date.now();
+          saved.urgent = saved.version !== current.version && saved.urgent;
+          delete saved.retryAt;
+        });
+      } catch (error) {
+        logError("interaction-card-delivery", error);
+        const status = object(error) ? error.statusCode ?? error.status ?? (object(error.response) ? error.response.status : undefined) : undefined;
+        let retry = options.statusUpdateMs;
+        if (status === 429 && object(error) && object(error.response)) {
+          const headers = error.response.headers;
+          const value = headers instanceof Headers ? headers.get("retry-after")
+            : object(headers) ? headers["retry-after"] : undefined;
+          if (typeof value === "string") {
+            const seconds = Number(value);
+            const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - Date.now();
+            if (Number.isFinite(delay) && delay > 0) retry = Math.max(retry, Math.min(2_000_000_000, delay));
+          }
+        }
+        await this.store.mutate((draft) => {
+          const saved = draft.interaction!.surfaces[current.id]!;
+          if (current.activityId && status === 429) {
+            saved.delivery = "ready"; saved.retryAt = Date.now() + retry; saved.urgent = false;
+          } else if (current.activityId && status === 404 && !current.frozen &&
+            current.kind !== "result" && current.kind !== "digest") {
+            delete saved.activityId; saved.delivery = "pending"; saved.revision++; saved.version++; saved.urgent = true;
+            this.schedule(key);
+          } else {
+            saved.delivery = error instanceof DeliveryError && error.outcome !== "uncertain" ? "rejected" : "uncertain";
+            draft.conversations[key]!.notice = "Interaction card delivery is unconfirmed. Use !status/!home; no prompt or response was replayed.";
+          }
+        });
+      }
+    }
+  }
+
   private async deliver(): Promise<void> {
     if (!this.deliveryEnabled) return;
+    await this.expireFollows();
     const keys = [...this.dirty];
     this.dirty.clear();
     for (const key of keys) {
       const conversation = this.store.snapshot().conversations[key];
       if (!conversation) continue;
-      for (const item of this.store.snapshot().outbox.filter((entry) => entry.conversationKey === key && entry.status === "pending")) {
+      if (this.options.interaction) await this.prepareDigests(key);
+      for (const item of this.store.snapshot().outbox.filter((entry) => entry.conversationKey === key && entry.status === "pending" && !entry.digestId)) {
         const claimed = await this.store.mutate((state) => {
           const current = state.outbox.find((entry) => entry.id === item.id)!;
           if (current.status !== "pending") return false;
+          if (current.digest) {
+            const members = current.digest.memberIds.map((id) => state.outbox.find((entry) => entry.id === id));
+            if (members.some((member) => !member || member.status !== "pending" || !this.passiveEligible(state, member))) {
+              this.releasePendingDigest(state, current.id);
+              this.schedule(key);
+              return false;
+            }
+            for (const member of members) member!.status = "sending";
+          } else if (current.publication && !current.direct && !current.admissionId &&
+            Date.now() < (current.createdAt ?? 0) + (this.options.interaction?.digestMs ?? 60_000)) return false;
           if (current.historyId) {
             const conversation = state.conversations[key]!;
-            if (conversation.selectionBlocked || conversation.historyRead?.id !== current.historyId || conversation.selectedId !== current.sessionId) {
+            if (conversation.historyRead?.id !== current.historyId ||
+              !conversation.historyRead.readOnlyTarget && (conversation.selectionBlocked || conversation.selectedId !== current.sessionId)) {
               current.status = "cancelled";
               current.detail = "History source/read was superseded before delivery. No task or subscription was cancelled.";
               return false;
@@ -1566,18 +1979,36 @@ export class Bridge {
               return false;
             }
           }
+          if (current.follow && !current.direct && !current.admissionId && !this.passiveEligible(state, current)) {
+            current.status = "cancelled"; current.detail = "Following ended before notification claim.";
+            return false;
+          }
           current.status = "sending";
           return true;
         });
         if (!claimed) continue;
         try {
-          const activityId = await this.transport.send(conversation.reference, {
-            type: "text", text: item.text, ...(item.presentation ? { presentation: item.presentation } : {}),
-          });
+          const surfaceId = item.publication?.surfaceId ?? item.digest?.surfaceId;
+          const snapshot = this.store.snapshot();
+          const surface = surfaceId ? snapshot.interaction?.surfaces[surfaceId] : undefined;
+          if (surfaceId && !surface) throw new Error("Missing persisted result surface.");
+          const activityId = await this.transport.send(item.originReference ?? conversation.reference, surface ? {
+            type: "card", card: renderInteractionSurface(snapshot, surface, this.cards),
+            summary: item.digest ? "Followed Copilot sessions have new replies." : `Copilot reply - ${item.publication!.title}`,
+          } : { type: "text", text: item.text, ...(item.presentation ? { presentation: item.presentation } : {}) });
           await this.store.mutate((state) => {
             const current = state.outbox.find((entry) => entry.id === item.id)!;
             current.status = "sent";
             current.activityId = activityId;
+            if (current.digest) for (const id of current.digest.memberIds) {
+              const member = state.outbox.find((entry) => entry.id === id)!;
+              member.status = "sent"; member.activityId = activityId;
+            }
+            if (surface) {
+              const saved = state.interaction!.surfaces[surface.id]!;
+              saved.activityId = activityId; saved.delivery = "ready"; saved.renderedVersion = surface.version;
+              saved.lastUpdatedAt = Date.now(); saved.urgent = saved.version !== surface.version && saved.urgent;
+            }
           });
           console.log(JSON.stringify({
             area: item.historyId ? "teams-history-delivery" : "teams-final-delivery", outcome: "sent", outboxId: item.id, messageId: safeText(activityId, 2048),
@@ -1597,6 +2028,15 @@ export class Bridge {
                 entry.detail = rejected ? `Definite delivery rejection: ${error.code}.` : "Delivery outcome is uncertain.";
               }
             }
+            if (item.digest) for (const id of item.digest.memberIds) {
+              const member = state.outbox.find((entry) => entry.id === id)!;
+              if (member.status === "sending") {
+                member.status = rejected ? "rejected" : "uncertain";
+                member.detail = "Digest delivery was not confirmed. No individual repost will be attempted.";
+              }
+            }
+            const surfaceId = item.publication?.surfaceId ?? item.digest?.surfaceId;
+            if (surfaceId) state.interaction!.surfaces[surfaceId]!.delivery = rejected ? "rejected" : "uncertain";
             const label = item.historyId ? "HISTORY snapshot" : "Final-message";
             state.conversations[key]!.notice = rejected
               ? `${label} delivery was definitely rejected/not sent. It is not retried automatically; read the transcript.`
@@ -1605,11 +2045,22 @@ export class Bridge {
           if (!item.historyId) break;
         }
       }
+      if (this.options.interaction) {
+        await this.deliverInteractionSurfaces(key);
+        if (["home", "working", "needs-reply"].includes(this.store.snapshot().conversations[key]!.view)) continue;
+      }
       try {
         const current = this.store.snapshot().conversations[key]!;
+        const selected = this.store.snapshot().sessions[current.selectedId ?? ""];
+        const transition = digest(JSON.stringify([current.view, current.selectedId, current.revision, current.notice,
+          selected?.status, selected?.pending.map((request) => request.id)]));
+        const lastUpdate = this.dashboardUpdates.get(key);
+        if (this.options.interaction && current.dashboardId && lastUpdate?.transition === transition &&
+          Date.now() < lastUpdate.at + this.options.interaction.statusUpdateMs) continue;
         if (current.dashboardId) {
           try {
             await this.transport.update(current.reference, current.dashboardId, this.render(key));
+            this.dashboardUpdates.set(key, { at: Date.now(), transition });
           } catch (error) {
             const missing = object(error) && (error.statusCode === 404 || error.status === 404 ||
               (object(error.response) && error.response.status === 404));
@@ -1632,6 +2083,7 @@ export class Bridge {
         });
       }
     }
+    this.armInteractionWake();
   }
 
   private async createDashboard(key: string): Promise<void> {
@@ -1728,12 +2180,14 @@ export class Bridge {
   }
 
   async close(): Promise<void> {
+    if (this.interactionTimer) { clearTimeout(this.interactionTimer); this.interactionTimer = undefined; }
     if (this.subscriptionTimer) { clearInterval(this.subscriptionTimer); this.subscriptionTimer = undefined; }
     await this.subscriptionCheck;
     await this.events;
     await Promise.all(this.conversations.values());
     await this.flush();
     this.closing = true;
+    if (this.interactionTimer) { clearTimeout(this.interactionTimer); this.interactionTimer = undefined; }
     await this.runtime.close();
     await this.store.mutate((state) => {
       for (const admission of Object.values(state.admissions)) {

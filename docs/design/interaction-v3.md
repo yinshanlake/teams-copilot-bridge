@@ -1,5 +1,39 @@
 # Teams interaction v3: Phase 0 design note
 
+## Implementation record
+
+The source analysis below is the historical Phase 0 baseline, not a claim that
+later implementation leaves configuration unchanged.
+
+Phase 1 now ships the non-preview Focus path: independently scoped Inbox, turn,
+request and result cards; visible next-message target; read-only History/Show
+full; automatic/explicit following and Mute; origin-bound direct results; and
+passive-only digests. The main entry point and simulator enable it. Older direct
+Bridge test harnesses deliberately retain the legacy UI path to exercise
+compatibility; the new interaction tests exercise the production options.
+
+Store writes schema 2 and accepts validated schema 1 for atomic migration.
+Existing source/receipt/outbox populations are not subject to a new small UI
+record limit. A synthetic populated migration fixture retains sent outbox
+payloads, historical uncertain receipts, timed-out admissions and an
+enabled-but-paused revision-1 subscription. No historical admission is converted
+into a new running turn. State downgrade after accepting new work is not safe;
+retain all new dedup/receipt facts and a schema-aware binary.
+
+Result preview envelopes use an explicit `publication.version: 1` alongside
+the retained full body; Show full generates a separate read-only v4 chunk group.
+Existing unversioned/v2/v3/v4 outbox rows are not rewritten. Preview thread,
+native quote/reaction, and App waiting-state gates remain as described below.
+The source allowlist now includes this note and the shipped interaction module
+and tests; no dependency or endpoint-source change is needed.
+
+Phase 1 build/typecheck and all 278 offline tests passed. The Windows package
+checks passed for ZIP/menu/icon shape and rejection cases. The source audit
+passed with the explicit new files included. A typed mock and the intentional
+`!home` menu expectation were corrected before these final gates.
+
+## Historical design evidence
+
 Status: **proposal for owner review; no feature implementation**.
 Evidence date: 2026-11-17.
 Repository baseline: `dc81c718de8d3e8c0b18426af263b9d0909e3661`.

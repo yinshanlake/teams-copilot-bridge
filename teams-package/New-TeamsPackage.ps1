@@ -8,7 +8,7 @@ param(
     [ValidateLength(1, 30)][string]$AppName = 'Copilot Sessions',
     [ValidateLength(1, 32)][string]$DeveloperName = 'Local Copilot',
     [ValidatePattern('^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')]
-    [string]$Version = '0.1.0',
+    [string]$Version = '0.2.0',
     [string]$SchemaPath
 )
 

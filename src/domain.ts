@@ -125,6 +125,7 @@ export interface ConversationRecord {
   notice: string;
   read: Record<string, number>;
   surfaceId?: string;
+  actionVersion?: 2;
   sideParentId?: string;
   historyRead?: {
     id: string;
@@ -133,6 +134,7 @@ export interface ConversationRecord {
     receiptIds: string[];
     status: "reading" | "queued" | "failed" | "interrupted";
     superseded?: boolean;
+    readOnlyTarget?: boolean;
   };
 }
 
@@ -215,6 +217,74 @@ export interface OutboxItem {
   direct?: boolean;
   subscription?: { id: string; revision: number };
   historyId?: string;
+  createdAt?: number;
+  follow?: { id: string; revision: number };
+  publication?: { version: 1; title: string; surfaceId: string };
+  digest?: { version: 1; memberIds: string[]; surfaceId: string };
+  digestId?: string;
+  originReference?: ConversationReference;
+}
+
+export interface InteractionOptions {
+  statusUpdateMs: number;
+  followMs: number;
+  digestMs?: number;
+}
+
+export interface FollowPreference {
+  id: string;
+  conversationKey: string;
+  sessionId: string;
+  revision: number;
+  mode: "automatic" | "explicit" | "muted";
+  observation: "journal" | "live" | "unavailable";
+  expiresAt?: number;
+  detail: string;
+}
+
+export type InteractionSurfaceKind = "inbox" | "turn" | "request" | "result" | "digest";
+
+export interface InteractionSurface {
+  id: string;
+  conversationKey: string;
+  kind: InteractionSurfaceKind;
+  sessionId?: string;
+  turnId?: string;
+  requestId?: string;
+  outboxId?: string;
+  revision: number;
+  version: number;
+  renderedVersion?: number;
+  activityId?: string;
+  delivery: "pending" | "sending" | "ready" | "uncertain" | "rejected";
+  lastUpdatedAt?: number;
+  urgent: boolean;
+  frozen?: string;
+  retryAt?: number;
+}
+
+export interface InteractionTurn {
+  id: string;
+  conversationKey: string;
+  sessionId: string;
+  teamsActivityId: string;
+  reference: ConversationReference;
+  surfaceId: string;
+  messageId?: string;
+  nativeTurnId?: string;
+  state: "admitting" | "accepted" | "executing" | "waiting" | "result" | "done" | "failed" | "stopped" | "uncertain";
+  at: number;
+  finishedAt?: number;
+  intent?: string;
+  summary?: string;
+  steps: Array<{ id: string; name: string; state: "running" | "done" | "failed" }>;
+}
+
+export interface InteractionState {
+  surfaces: Record<string, InteractionSurface>;
+  turns: Record<string, InteractionTurn>;
+  follows: Record<string, FollowPreference>;
+  active: Record<string, string>;
 }
 
 export interface JournalCursor {
@@ -243,7 +313,7 @@ export interface DirectOrigin {
 }
 
 export interface BridgeState {
-  schema: 1;
+  schema: 1 | 2;
   owner: string;
   actionKey: string;
   controllerId?: string;
@@ -254,6 +324,7 @@ export interface BridgeState {
   admissions: Record<string, AppAdmission>;
   subscriptions: Record<string, Subscription>;
   directOrigins: Record<string, DirectOrigin>;
+  interaction?: InteractionState;
 }
 
 export interface RuntimeEvent {
@@ -303,7 +374,7 @@ export interface Card {
   actions?: Record<string, unknown>[];
 }
 
-export type Outbound = { type: "card"; card: Card } | { type: "text"; text: string; presentation?: ReplyPresentation };
+export type Outbound = { type: "card"; card: Card; summary?: string } | { type: "text"; text: string; presentation?: ReplyPresentation };
 
 export interface Transport {
   readonly connected?: boolean;
@@ -330,6 +401,7 @@ export interface BridgeOptions {
   subscriptionPollMs?: number;
   subscriptionReadTimeoutMs?: number;
   subscriptionBaselineTimeoutMs?: number;
+  interaction?: InteractionOptions;
 }
 
 export function viewTarget(state: BridgeState, conversation: ConversationRecord): string | undefined {

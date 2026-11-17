@@ -2,7 +2,8 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { isSessionListView, type ConversationRecord, type View } from "./domain.js";
 import { canonicalId, object, string, UserError } from "./safety.js";
 
-export const operations = ["view", "page", "filter", "select", "create", "send", "refresh", "stop", "pick-model", "settings", "answer", "subscribe", "unsubscribe"] as const;
+export const operations = ["view", "page", "filter", "select", "create", "send", "refresh", "stop", "pick-model", "settings", "answer", "subscribe", "unsubscribe",
+  "show-full", "history-source", "inbox", "follow", "mute", "open-source"] as const;
 export type Operation = typeof operations[number];
 
 export interface ActionScope {
@@ -15,7 +16,7 @@ export interface ActionScope {
 }
 
 export interface ActionClaims extends ActionScope {
-  version: 1;
+  version: 1 | 2;
   nonce: string;
   conversation: string;
   selected: string;
@@ -53,7 +54,7 @@ export class Actions {
 
   issue(conversation: ConversationRecord, scope: ActionScope, now = Date.now()): string {
     const claims: ActionClaims = {
-      ...scope, version: 1, nonce: randomUUID(), conversation: conversation.key,
+      ...scope, version: conversation.actionVersion ?? 1, nonce: randomUUID(), conversation: conversation.key,
       selected: conversation.selectedId ?? "", revision: conversation.revision, expires: now + this.ttlMs,
       view: conversation.view,
       ...(conversation.view === "sides" && conversation.sideParentId && !scope.targetId ? { targetId: conversation.sideParentId } : {}),
@@ -89,7 +90,7 @@ export class Actions {
     } catch {
       throw new UserError("Invalid card action payload.");
     }
-    if (!object(claims) || claims.version !== 1 || !string(claims.nonce) ||
+    if (!object(claims) || (claims.version !== 1 && claims.version !== 2) || !string(claims.nonce) ||
       !string(claims.conversation) || typeof claims.selected !== "string" ||
       !Number.isSafeInteger(claims.revision) || typeof claims.expires !== "number" ||
       !isOperation(claims.op) ||
@@ -102,7 +103,7 @@ export class Actions {
       throw new UserError("Invalid card action payload.");
     }
     const verified: ActionClaims = {
-      version: 1, nonce: claims.nonce, conversation: claims.conversation, selected: claims.selected,
+      version: claims.version, nonce: claims.nonce, conversation: claims.conversation, selected: claims.selected,
       revision: Number(claims.revision), expires: claims.expires, op: claims.op,
       ...(claims.view === undefined ? {} : { view: claims.view }),
       ...(claims.query === undefined ? {} : { query: claims.query }),

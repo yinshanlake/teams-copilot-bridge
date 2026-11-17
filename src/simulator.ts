@@ -10,6 +10,7 @@ import { FakeRuntime } from "./fake-runtime.js";
 import { Store } from "./store.js";
 import { validateTeamsOwnerActivity, type TeamsIdentity } from "./teams.js";
 import { logError, publicError, UserError } from "./safety.js";
+import { interactionDefaults } from "./interaction.js";
 
 export const mockIdentity: TeamsIdentity = {
   tenantId: "11111111-1111-4111-a111-111111111111",
@@ -66,14 +67,15 @@ export interface Simulator {
   close(): Promise<void>;
 }
 
-export async function startSimulator(options: { port: number; stateDirectory: string; workspace: string; tickMs?: number }): Promise<Simulator> {
+export async function startSimulator(options: { port: number; stateDirectory: string; workspace: string; tickMs?: number; interaction?: boolean }): Promise<Simulator> {
   const token = randomBytes(32).toString("base64url");
   const store = await Store.open(options.stateDirectory, `mock:${mockIdentity.tenantId}:${mockIdentity.ownerId}`);
   const transport = new PreviewTransport();
-  const bridge = new Bridge(store, new FakeRuntime(options.tickMs), transport, {
+  const bridge = new Bridge(store, new FakeRuntime(options.tickMs, true, options.interaction !== false), transport, {
     owner: store.snapshot().owner,
     workspaces: [{ id: "local", name: "MOCK local workspace (no tools execute)", path: options.workspace }],
     coalesceMs: 200, cardActions: "submit",
+    ...(options.interaction === false ? {} : { interaction: interactionDefaults }),
   });
   try { await bridge.start(); } catch (error) {
     await bridge.close();

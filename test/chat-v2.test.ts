@@ -55,7 +55,7 @@ test("Teams manifest advertises only explicit ! personal-chat commands, never sl
   assert.deepEqual(bot.commandLists[0].scopes, ["personal"]);
   assert.ok(Array.isArray(bot.commandLists[0].commands));
   assert.deepEqual(bot.commandLists[0].commands.map((command) => object(command) && command.title),
-    ["!sessions", "!history", "!status", "!subscribe", "!unsubscribe", "!help"]);
+    ["!sessions", "!history", "!status", "!subscribe", "!unsubscribe", "!help", "!home"]);
 });
 
 test("v2 lists show three canonical selectable rows and the latest two actual dialogue entries without invented pairs or tool noise", async (t) => {
