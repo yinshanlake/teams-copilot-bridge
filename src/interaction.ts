@@ -10,6 +10,7 @@ import { digest, object, safeText, string, UserError } from "./safety.js";
 
 export const interactionDefaults: InteractionOptions = {
   statusUpdateMs: 5000, followMs: 24 * 60 * 60_000, digestMs: 60_000,
+  remoteApprovals: true, approvalTimeoutMs: 15 * 60_000,
 };
 
 export function interactionState(state: BridgeState): InteractionState {
@@ -155,6 +156,7 @@ export function observeInteraction(state: BridgeState, incoming: RuntimeEvent): 
   const explicit = turnForOrigin(state, session.id,
     data.originatingMessageId ?? (typeof event.type === "string" && event.type.startsWith("bridge.app_") ? data.messageId : undefined));
   const turn = explicit ?? (session.kind === "owned" ? active : undefined);
+  if (explicit && session.kind === "owned" && event.type === "assistant.message" && !explicit.finishedAt) ui.active[session.id] = explicit.id;
   if (turn) {
     if (event.type === "assistant.turn_start" && string(data.turnId)) {
       turn.nativeTurnId = data.turnId;
@@ -206,21 +208,31 @@ export function observeInteraction(state: BridgeState, incoming: RuntimeEvent): 
       "user.message", "user_input.requested", "user_input.completed", "permission.requested", "permission.completed",
       "exit_plan_mode.requested", "exit_plan_mode.completed", "session.idle", "session.error", "session.task_complete",
       "session.shutdown", "abort", "bridge.app_admission_consumed", "bridge.app_admission_confirmed", "bridge.app_output_unavailable",
+      "bridge.permission_resolved", "bridge.approval_unconfirmed", "bridge.approval_timeout_submitted", "elicitation.requested", "elicitation.completed",
     ].includes(String(event.type)));
     if (session.kind !== "owned") continue;
     for (const pending of session.pending) {
       const existing = Object.values(ui.surfaces).find((surface) => surface.kind === "request" &&
-        surface.conversationKey === conversation.key && surface.sessionId === session.id && surface.requestId === pending.id);
+        !surface.frozen && surface.conversationKey === conversation.key && surface.sessionId === session.id && surface.requestId === pending.id);
+      const requestHash = digest(JSON.stringify(pending));
       if (!existing && (turn?.conversationKey === conversation.key || follows(state, conversation.key, session.id))) {
-        newSurface(state, conversation.key, "request", {
+        const requestSurface = newSurface(state, conversation.key, "request", {
           sessionId: session.id, requestId: pending.id, ...(turn ? { turnId: turn.id } : {}),
         });
+        requestSurface.requestHash = requestHash;
+      } else if (existing && existing.requestHash !== requestHash) {
+        existing.requestHash = requestHash; existing.revision++; touchSurface(existing, true);
       }
       for (const header of Object.values(ui.surfaces)) {
         if (header.kind === "header" && header.sessionId === session.id && !header.frozen) {
+          const requestHash = digest(JSON.stringify(session.pending));
+          if (header.requestHash !== requestHash) {
+            header.requestHash = requestHash; header.revision++;
+          }
           touchSurface(header, ["user.message", "user_input.requested", "user_input.completed", "permission.requested", "permission.completed",
             "exit_plan_mode.requested", "exit_plan_mode.completed", "session.idle", "session.error", "session.task_complete",
-            "session.shutdown", "abort", "bridge.app_admission_consumed", "bridge.app_admission_confirmed", "bridge.app_output_unavailable"].includes(String(event.type)));
+            "session.shutdown", "abort", "bridge.app_admission_consumed", "bridge.app_admission_confirmed", "bridge.app_output_unavailable",
+            "bridge.permission_resolved", "bridge.approval_unconfirmed", "bridge.approval_timeout_submitted", "elicitation.requested", "elicitation.completed"].includes(String(event.type)));
         }
       }
     }
@@ -228,7 +240,13 @@ export function observeInteraction(state: BridgeState, incoming: RuntimeEvent): 
   for (const surface of Object.values(ui.surfaces)) {
     if (surface.kind === "request" && surface.sessionId === session.id && !surface.frozen &&
       !session.pending.some((pending) => pending.id === surface.requestId)) {
-      surface.frozen = event.type === "abort" || event.type === "session.shutdown" ? "Request cancelled." : "Request resolved.";
+      const outcomes: Record<string, string> = {
+        once: "Allowed once by you.", session: "Allowed for this session by you.", deny: "Denied by you.",
+        timeout: "Timed out - user not available. The native response was acknowledged.", elsewhere: "Already resolved in the native host.",
+      };
+      surface.frozen = event.type === "bridge.permission_resolved" && data.requestId === surface.requestId
+        ? outcomes[String(data.outcome)] ?? "Request resolved."
+        : event.type === "abort" || event.type === "session.shutdown" ? "Request cancelled." : "Request resolved.";
       surface.revision++;
       touchSurface(surface, true);
     }
@@ -246,7 +264,9 @@ export function renderInteractionSurface(
   if (surface.kind === "inbox") {
     const conversation = state.conversations[surface.conversationKey]!;
     const sources = Object.values(state.sessions).filter((source) => source.kind !== "controller");
-    const waiting = sources.filter((source) => source.pending.length && source.kind === "owned" && source.status !== "offline");
+    const waiting = sources.filter((source) => source.pending.some((pending) =>
+      !pending.responseState && (pending.expiresAt === undefined || pending.expiresAt > now)) &&
+      source.kind === "owned" && source.status !== "offline");
     const running = sources.filter((source) => source.status === "busy" && source.executionObserved !== false &&
       (source.peerSource !== "app" || (source.liveUntil ?? 0) > now));
     const completed = Object.values(state.interaction?.turns ?? {}).filter((turn) =>
@@ -321,8 +341,24 @@ export function renderInteractionSurface(
   }
   if (surface.kind === "request") {
     const pending = session?.pending.find((request) => request.id === surface.requestId);
+    if (state.interaction?.remoteApprovals === false && (pending?.kind === "permission" || pending?.kind === "plan")) {
+      return card([block(title), block("Remote approvals are disabled. No approval action is available.")]);
+    }
     return session && pending ? cards.requestSurface(context, session, pending)
       : card([block(title, { weight: "Bolder" }), block("Already resolved. No response was sent.")]);
+  }
+  if (surface.kind === "stop") {
+    if (!surface.stop || surface.stop.state !== "pending" || surface.stop.expiresAt <= now || session?.kind !== "owned") {
+      return card([block(title), block("Stop confirmation is expired, unavailable, or already attempted. No stop is replayed.")]);
+    }
+    return card([
+      block(`Confirm Stop - ${title}`, { weight: "Bolder" }),
+      block("Stop only the message currently processing in this owned session. Queued or background work may remain; history is not deleted."),
+      block(`Target: ${surface.sessionId}`, { size: "Small" }),
+    ], [
+      action("Confirm Stop", { op: "confirm-stop", targetId: surface.sessionId! }),
+      action("Cancel", { op: "cancel-stop", targetId: surface.sessionId! }),
+    ]);
   }
   if (surface.kind === "header") {
     const header = cards.render({ ...state, conversations: { ...state.conversations, [context.key]: context } }, context.key);
@@ -354,6 +390,8 @@ export function renderInteractionSurface(
     const minutes = Math.max(0, Math.floor(((turn.finishedAt ?? now) - turn.at) / 60_000));
     const queued = Object.values(state.interaction?.turns ?? {}).filter((candidate) =>
       candidate.sessionId === turn.sessionId && candidate.state === "accepted").length;
+    const steering = Object.values(state.interaction?.steers ?? {}).filter((entry) => entry.parentTurnId === turn.id)
+      .sort((a, b) => b.at - a.at)[0];
     const body = [
       block(`${labels[turn.state]} - ${title}`, { weight: "Bolder" }),
       block(`Target: ${turn.sessionId}`, { size: "Small" }),
@@ -362,15 +400,28 @@ export function renderInteractionSurface(
       ...turn.steps.map((step) => block(`${step.state}: ${step.name}`, { size: "Small" })),
       block(`Tracked queue: ${queued} waiting (not a host-wide count)`, { size: "Small" }),
       block(followDescription(state, turn.conversationKey, turn.sessionId, now), { size: "Small" }),
+      ...(steering ? [block(`Steering ${steering.state}. Acceptance is not consumption or a separate completed task; native-origin results keep the original recipient.`,
+        { size: "Small", color: steering.state === "uncertain" ? "Warning" : "Default" })] : []),
     ];
-    return card(body, [
+    const activeOwned = session?.kind === "owned" && state.interaction?.active[turn.sessionId] === turn.id && !turn.finishedAt;
+    const controls = [
       action("History", { op: "history-source", targetId: turn.sessionId }),
+      ...(activeOwned && !session.pending.length ? [{
+        type: "Action.ShowCard", title: "Steer", card: card([
+          block("Send immediately to this same owned session. This does not change the next-message target."),
+          { type: "Input.Text", id: "steering", label: "Steering instruction", isMultiline: true, isRequired: true, maxLength: 64_000 },
+        ], [cards.scopedAction(context, "Send steering", { op: "steer", targetId: turn.sessionId, argument: turn.id }, true)]),
+      }] : []),
+      ...(activeOwned ? [action("Stop", { op: "stop", targetId: turn.sessionId })] : []),
+      { type: "Action.ShowCard", title: "More", card: card([], [
       action("Change next target", { op: "view", argument: "sessions" }),
       action(follows(state, turn.conversationKey, turn.sessionId, now) ? "Mute" : "Follow", {
         op: follows(state, turn.conversationKey, turn.sessionId, now) ? "mute" : "follow", targetId: turn.sessionId,
       }),
       action("Inbox", { op: "inbox" }),
-    ]);
+      ]) },
+    ];
+    return card(body, controls);
   }
   const item = state.outbox.find((entry) => entry.id === surface.outboxId);
   if (!item) throw new UserError("This result is no longer available.");
@@ -404,7 +455,8 @@ export function renderInteractionSurface(
   return card([
     block(`${item.eventId.startsWith("error:") ? "Source reported an error" : turn?.state === "done" ? "Done" : "New reply"} - ${item.publication?.title ?? title}`, { weight: "Bolder" }),
     block(safeText(turn?.summary ?? item.text, 600), {}, 800),
-    ...(turn ? [block(`Task receipt: ${turn.id.slice(0, 8)} - original Teams prompt`, { size: "Small" })] : []),
+    ...(turn ? [block(`Task receipt: ${turn.id.slice(0, 8)} - original Teams prompt`, { size: "Small" })]
+      : item.publication?.taskReceiptId ? [block(`Related task receipt: ${item.publication.taskReceiptId.slice(0, 8)} - steering context`, { size: "Small" })] : []),
     block(`Source: ${item.sessionId}`, { size: "Small" }),
   ], [
     action("Show full", { op: "show-full", targetId: item.sessionId, argument: item.id }),

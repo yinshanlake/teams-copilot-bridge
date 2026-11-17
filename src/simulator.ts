@@ -72,7 +72,8 @@ export async function startSimulator(options: { port: number; stateDirectory: st
   const token = randomBytes(32).toString("base64url");
   const store = await Store.open(options.stateDirectory, `mock:${mockIdentity.tenantId}:${mockIdentity.ownerId}`);
   const transport = new PreviewTransport();
-  const bridge = new Bridge(store, new FakeRuntime(options.tickMs, true, options.interaction !== false), transport, {
+  const bridge = new Bridge(store, new FakeRuntime(options.tickMs, true, options.interaction !== false,
+    options.interaction === false ? undefined : interactionDefaults), transport, {
     owner: store.snapshot().owner,
     workspaces: [{ id: "local", name: "MOCK local workspace (no tools execute)", path: options.workspace }],
     coalesceMs: 200, cardActions: "submit",
@@ -166,7 +167,7 @@ async function main(): Promise<void> {
   const simulator = await startSimulator({
     port, stateDirectory: resolve(process.env.SIMULATOR_STATE_DIRECTORY ?? ".bridge\\simulator"), workspace: process.cwd(),
   });
-  console.log(`MOCK ONLY - no real Copilot model calls or Teams sends.\nPreview: http://127.0.0.1:${simulator.port}\nScenarios: ordinary text, ask, permission, plan, background, long, error. Commands: !sessions, !use <name or ID>, !history, !status, !subscribe, !unsubscribe, !help.`);
+  console.log(`MOCK ONLY - no real Copilot model calls or Teams sends.\nPreview: http://127.0.0.1:${simulator.port}\nScenarios: ordinary text, ask, permission, plan, form (unsupported remote UI), background, long, error. Commands: !sessions, !use <name or ID>, !history, !status, !subscribe, !unsubscribe, !help.`);
   let stopping = false;
   const stop = () => {
     if (stopping) return;

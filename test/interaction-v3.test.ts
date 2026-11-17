@@ -68,7 +68,7 @@ test("v3 request surfaces survive Inbox/navigation/focus updates and still answe
   await h.bridge.flush();
   const before = h.bridge.store.snapshot();
   const request = surface(before, "request", a);
-  const approval = findAction(renderInteractionSurface(before, request, h.bridge.cards), "Approve once");
+  const approval = findAction(renderInteractionSurface(before, request, h.bridge.cards), "Allow once");
   await h.text("!home");
   const b = await createWorking(h, "Other source");
   await h.text("ask");
@@ -106,7 +106,7 @@ test("UI-H1: the current session header clears completed approval controls while
   assert.ok(header.activityId);
   assert.match(JSON.stringify(h.transport.messages.get(header.activityId)), /Needs reply/);
   const request = surface(before, "request", b);
-  const approval = findAction(renderInteractionSurface(before, request, h.bridge.cards), "Approve once");
+  const approval = findAction(renderInteractionSurface(before, request, h.bridge.cards), "Allow once");
   const currentInbox = surface(before, "inbox");
   await h.action(findAction(renderInteractionSurface(before, currentInbox, h.bridge.cards), "Refresh"));
   assert.equal(h.bridge.store.snapshot().conversations[h.key]!.view, "home");
@@ -118,7 +118,7 @@ test("UI-H1: the current session header clears completed approval controls while
   const visible = h.transport.messages.get(header.activityId)!;
   assert.equal(visible.message.type, "card");
   assert.doesNotMatch(JSON.stringify(visible), /Needs reply|"title":"Review approval"/);
-  assert.throws(() => findAction(visible, "Approve once"), /not found/);
+  assert.throws(() => findAction(visible, "Allow once"), /not found/);
   assert.equal(after.conversations[h.key]!.view, "home");
   assert.equal(Object.values(after.interaction!.surfaces).filter((entry) => entry.kind === "header" && !entry.frozen).length, 1);
 });
@@ -264,7 +264,7 @@ test("v3 schema migration preserves a populated legacy journal, sent bytes, unce
   await writeFile(join(directory, "state.json"), JSON.stringify(legacy));
   const migrated = await Store.open(directory, "test-owner");
   const current = migrated.snapshot();
-  assert.equal(current.schema, 3);
+  assert.equal(current.schema, 4);
   assert.equal(Object.keys(current.sessions).length, 357);
   assert.equal(Object.keys(current.conversations).length, 1);
   assert.deepEqual(current.outbox, legacy.outbox);
@@ -657,4 +657,154 @@ test("F3: the final signed payload budget is checked before members are claimed,
   state = h.bridge.store.snapshot();
   assert.equal(state.outbox.filter((item) => item.publication && item.status === "sent").length, 3);
   assert.equal(state.outbox.filter((item) => item.status === "uncertain").length, 0);
+});
+
+test("v3 Stop requires a distinct owner confirmation, preserves the current focus and never repeats a consumed stop", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const a = await createWorking(h, "Stop A only");
+  await h.text("work A");
+  await h.text("!stop");
+  assert.equal(h.runtime.stopped.length, 0);
+  let state = h.bridge.store.snapshot();
+  await h.action(findAction(renderInteractionSurface(state, surface(state, "stop", a), h.bridge.cards), "Cancel"));
+  assert.equal(h.runtime.stopped.length, 0);
+  await h.text("!stop");
+  state = h.bridge.store.snapshot();
+  const confirm = findAction(renderInteractionSurface(state, surface(state, "stop", a), h.bridge.cards), "Confirm Stop");
+  const b = await createWorking(h, "Keep B selected");
+  await h.action(confirm);
+  assert.deepEqual(h.runtime.stopped, [a]);
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b);
+  await h.action(confirm);
+  assert.deepEqual(h.runtime.stopped, [a]);
+});
+
+test("v3 an old Stop confirmation cannot abort a different observed request and App sources never expose remote Stop", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.text("first request");
+  await h.text("!stop");
+  const state = h.bridge.store.snapshot();
+  const old = findAction(renderInteractionSurface(state, surface(state, "stop", id), h.bridge.cards), "Confirm Stop");
+  h.runtime.emit(id, "abort");
+  h.runtime.emit(id, "session.idle");
+  await h.text("next request");
+  await h.action(old);
+  assert.equal(h.runtime.stopped.length, 0);
+  await h.bridge.store.mutate((draft) => {
+    draft.sessions[id]!.kind = "peer";
+    draft.sessions[id]!.peerSource = "app";
+  });
+  await h.text("!stop");
+  assert.equal(h.runtime.stopped.length, 0);
+  assert.match(h.bridge.store.snapshot().conversations[h.key]!.notice, /original host/);
+});
+
+test("v3 Steer sends immediate unchanged text to the original owned source without redirecting its result or the next focus", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const a = await createWorking(h, "Steered source");
+  await h.text("original task", "original-steering-context");
+  let state = h.bridge.store.snapshot();
+  const turn = Object.values(state.interaction!.turns)[0]!;
+  const b = await createWorking(h, "Current other focus");
+  state = h.bridge.store.snapshot();
+  const steering = findAction(renderInteractionSurface(state, surface(state, "turn", a), h.bridge.cards), "Send steering");
+  const text = "  steer this exact text\r\nwithout changing it  ";
+  await h.action(steering, { steering: text });
+  assert.deepEqual(h.runtime.received.at(-1), { sessionId: a, text });
+  assert.equal(h.runtime.sendModes.at(-1)!.mode, "immediate");
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b);
+  assert.equal(Object.values(h.bridge.store.snapshot().interaction!.turns).length, 1, "steering is not claimed to be a new completed turn");
+  const receipt = Object.values(h.bridge.store.snapshot().interaction!.steers!)[0]!;
+  assert.equal(receipt.state, "accepted");
+  h.runtime.emit(a, "assistant.message", { messageId: "steered-result", originatingMessageId: turn.messageId, content: "Original task result" });
+  await h.bridge.flush();
+  const result = h.bridge.store.snapshot().outbox.find((item) => item.eventId === "steered-result")!;
+  assert.equal(result.direct, true);
+  assert.equal(result.originReference?.activityId, "original-steering-context");
+  await h.action(steering, { steering: "a changed duplicate cannot run" });
+  assert.equal(h.runtime.received.length, 2);
+});
+
+test("v3 permission details are redacted, session approval is explicit, and off offers no permission or plan Allow controls", async (t) => {
+  const on = await harness(t, true, undefined, { interaction: options });
+  const id = await createWorking(on);
+  await on.text("permission");
+  await eventually(() => Boolean(on.bridge.store.snapshot().sessions[id]?.pending.length));
+  const state = on.bridge.store.snapshot();
+  const request = surface(state, "request", id);
+  const card = renderInteractionSurface(state, request, on.bridge.cards);
+  assert.match(JSON.stringify(card), /Sensitive values are masked/);
+  assert.doesNotMatch(JSON.stringify(card), /hidden-fixture/);
+  await on.action(findAction(card, "Allow for this session"));
+  assert.equal(on.runtime.answers[0]!.answer.permission, "session");
+  assert.equal(on.bridge.store.snapshot().interaction!.surfaces[request.id]!.frozen, "Allowed for this session by you.");
+  const off = await harness(t, true, undefined, { interaction: { ...options, remoteApprovals: false } });
+  const offId = await createWorking(off);
+  await off.text("permission");
+  await eventually(() => off.bridge.store.snapshot().sessions[offId]?.status === "idle");
+  const rendered = JSON.stringify(off.bridge.render(off.key));
+  assert.doesNotMatch(rendered, /"title":"(?:Allow once|Allow for this session|Approve once|Approve plan)"/);
+  assert.equal(off.runtime.answers.length, 0);
+});
+
+test("v3 unrenderable approval details cannot be allowed, while forms remain visibly unavailable rather than answered by text", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.text("request");
+  const requestId = randomUUID();
+  h.runtime.emit(id, "permission.requested", { requestId,
+    permissionRequest: { kind: "shell", intention: "Oversized command", fullCommandText: "x".repeat(33_000), canOfferSessionApproval: true } });
+  await h.bridge.flush();
+  let state = h.bridge.store.snapshot();
+  const request = renderInteractionSurface(state, surface(state, "request", id), h.bridge.cards);
+  assert.throws(() => findAction(request, "Allow once"), /not found/);
+  assert.throws(() => findAction(request, "Allow for this session"), /not found/);
+  assert.ok(findAction(request, "Deny"));
+  h.runtime.emit(id, "permission.completed", { requestId, result: { kind: "denied-interactively-by-user" } });
+  const formId = randomUUID();
+  h.runtime.emit(id, "elicitation.requested", { requestId: formId, message: "Structured input", mode: "form",
+    requestedSchema: { type: "object", properties: { value: { type: "string" } } } }, { ephemeral: true });
+  await h.bridge.flush();
+  state = h.bridge.store.snapshot();
+  const form = Object.values(state.interaction!.surfaces).find((entry) => entry.requestId === formId)!;
+  const output = renderInteractionSurface(state, form, h.bridge.cards);
+  assert.match(JSON.stringify(output), /Structured form responses are unavailable/);
+  assert.throws(() => findAction(output, "Answer"), /not found/);
+  assert.equal(h.runtime.answers.length, 0);
+});
+
+test("v3 permission expiry does not invent an owner response and invalid approval configuration fails closed", async (t) => {
+  const h = await harness(t, true, undefined, { interaction: { ...options, approvalTimeoutMs: 40 } });
+  const id = await createWorking(h);
+  await h.text("permission");
+  await eventually(() => Object.values(h.bridge.store.snapshot().interaction!.surfaces).some((entry) =>
+    entry.kind === "request" && entry.sessionId === id && Boolean(entry.frozen?.startsWith("Timed out"))));
+  assert.equal(h.runtime.answers.length, 0);
+  assert.throws(() => interactionConfiguration({ BRIDGE_REMOTE_APPROVALS: "yes" }), /on or off/);
+  assert.throws(() => interactionConfiguration({ BRIDGE_APPROVAL_TIMEOUT_MINUTES: "0" }), /positive integer/);
+});
+
+test("v3 a locally submitted question answer remains pending native confirmation without offering a second response", async (t) => {
+  const h = await harness(t, true, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.text("ask");
+  await eventually(() => Boolean(h.bridge.store.snapshot().sessions[id]?.pending.length));
+  const before = h.bridge.store.snapshot();
+  const request = surface(before, "request", id);
+  const answer = findAction(renderInteractionSurface(before, request, h.bridge.cards), "Answer");
+  const submit = t.mock.method(h.runtime, "answer", async () => undefined);
+  await h.action(answer, { [`choice_${inputSuffix(request.requestId!)}`]: "0" });
+  let state = h.bridge.store.snapshot();
+  assert.equal(state.sessions[id]!.pending[0]!.responseState, "submitted");
+  const pending = renderInteractionSurface(state, state.interaction!.surfaces[request.id]!, h.bridge.cards);
+  assert.match(JSON.stringify(pending), /Awaiting native confirmation/);
+  assert.throws(() => findAction(pending, "Answer"), /not found/);
+  await h.action(answer, { [`choice_${inputSuffix(request.requestId!)}`]: "1" });
+  assert.equal(submit.mock.callCount(), 1);
+  h.runtime.emit(id, "user_input.completed", { requestId: request.requestId, answer: "Proceed", wasFreeform: false });
+  await h.bridge.flush();
+  state = h.bridge.store.snapshot();
+  assert.equal(state.sessions[id]!.pending.length, 0);
+  assert.ok(state.interaction!.surfaces[request.id]!.frozen);
 });

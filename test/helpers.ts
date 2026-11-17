@@ -41,7 +41,7 @@ export async function harness(
 ): Promise<Harness> {
   const path = directory ?? await temporary(t);
   const store = await Store.open(path, "test-owner");
-  const runtime = new FakeRuntime(2, autonomous, Boolean(options.interaction));
+  const runtime = new FakeRuntime(2, autonomous, Boolean(options.interaction), options.interaction);
   const transport = new PreviewTransport();
   const bridge = new Bridge(store, runtime, transport, {
     owner: "test-owner", workspaces: [{ id: "local", name: "Test workspace", path }],

@@ -12,15 +12,20 @@ function settings(value: unknown): boolean {
 function timeline(value: unknown): boolean {
   return Array.isArray(value) && value.every((entry) => object(entry) && string(entry.id) && typeof entry.text === "string" &&
     (entry.timestamp === undefined || (typeof entry.timestamp === "string" && Number.isFinite(Date.parse(entry.timestamp)))) &&
-    ["user", "assistant", "tool", "agent", "input", "permission", "plan", "task", "error", "status"].includes(String(entry.kind)) &&
+    ["user", "assistant", "tool", "agent", "input", "permission", "plan", "form", "task", "error", "status"].includes(String(entry.kind)) &&
     (entry.phase === undefined || entry.phase === "commentary" || entry.phase === "final") &&
     (entry.state === undefined || ["running", "done", "failed", "answered", "skipped", "waiting", "cancelled"].includes(String(entry.state))));
 }
 
 function pending(value: unknown): boolean {
   return Array.isArray(value) && value.every((entry) => object(entry) && string(entry.id) && typeof entry.title === "string" &&
-    ["input", "permission", "plan"].includes(String(entry.kind)) && typeof entry.allowFreeform === "boolean" &&
-    Array.isArray(entry.choices) && entry.choices.every((choice) => typeof choice === "string"));
+    ["input", "permission", "plan", "form"].includes(String(entry.kind)) && typeof entry.allowFreeform === "boolean" &&
+    Array.isArray(entry.choices) && entry.choices.every((choice) => typeof choice === "string") &&
+    (entry.details === undefined || typeof entry.details === "string" && entry.details.length <= 16_000) &&
+    (entry.detailsComplete === undefined || typeof entry.detailsComplete === "boolean") &&
+    (entry.canApproveSession === undefined || typeof entry.canApproveSession === "boolean") &&
+    (entry.responseState === undefined || entry.responseState === "submitted" || entry.responseState === "unconfirmed") &&
+    (entry.expiresAt === undefined || Number.isSafeInteger(entry.expiresAt)));
 }
 
 function admissions(value: unknown): boolean {
@@ -35,6 +40,7 @@ function admissions(value: unknown): boolean {
     ["watching", "timed_out", "interrupted", "failed", "settled"].includes(String(item.observation)) &&
     Array.isArray(item.receiptIds) && item.receiptIds.every((entry) => string(entry, 512)) &&
     Array.isArray(item.resultIds) && item.resultIds.every((entry) => string(entry, 512)) &&
+    (item.reference === undefined || object(item.reference)) &&
     [item.executionIndex, item.completionIndex].every((entry) => entry === undefined || (Number.isSafeInteger(entry) && Number(entry) >= 0))));
 }
 
@@ -71,6 +77,12 @@ function interaction(value: unknown): boolean {
   const integer = (entry: unknown, minimum = 0) => Number.isSafeInteger(entry) && Number(entry) >= minimum;
   if (!object(value) || !object(value.surfaces) || !object(value.turns) || !object(value.follows) || !object(value.active)) return false;
   if (value.capabilityNotice !== undefined && !string(value.capabilityNotice, 2000)) return false;
+  if (value.remoteApprovals !== undefined && typeof value.remoteApprovals !== "boolean") return false;
+  if (value.steers !== undefined && (!object(value.steers) || !Object.entries(value.steers).every(([id, entry]) =>
+    object(entry) && entry.id === id && string(id, 64) && canonicalId(entry.sessionId) &&
+    string(entry.conversationKey) && string(entry.parentTurnId, 64) && integer(entry.at) &&
+    ["sending", "accepted", "uncertain", "rejected"].includes(String(entry.state)) &&
+    (entry.messageId === undefined || string(entry.messageId, 512))))) return false;
   if (value.aliases !== undefined && (!object(value.aliases) || !Object.entries(value.aliases).every(([key, target]) =>
     /^[a-f0-9]{64}$/u.test(key) && string(target, 512)))) return false;
   if (value.routes !== undefined && (!object(value.routes) || !Object.entries(value.routes).every(([id, route]) =>
@@ -81,7 +93,7 @@ function interaction(value: unknown): boolean {
     (route.sessionId === undefined || canonicalId(route.sessionId))))) return false;
   return Object.entries(value.surfaces).every(([id, item]) =>
     canonicalId(id) && object(item) && item.id === id && string(item.conversationKey) &&
-    ["inbox", "header", "turn", "request", "result", "digest", "routing"].includes(String(item.kind)) &&
+    ["inbox", "header", "turn", "request", "result", "digest", "routing", "stop"].includes(String(item.kind)) &&
     integer(item.revision, 1) && integer(item.version, 1) && typeof item.urgent === "boolean" &&
     ["pending", "sending", "ready", "uncertain", "rejected"].includes(String(item.delivery)) &&
     (item.sessionId === undefined || canonicalId(item.sessionId)) &&
@@ -89,6 +101,9 @@ function interaction(value: unknown): boolean {
     (item.renderedVersion === undefined || integer(item.renderedVersion)) &&
     (item.retryAt === undefined || integer(item.retryAt)) &&
     (item.page === undefined || integer(item.page)) &&
+    (item.requestHash === undefined || typeof item.requestHash === "string" && /^[a-f0-9]{64}$/u.test(item.requestHash)) &&
+    (item.stop === undefined || object(item.stop) && ["pending", "accepted", "cancelled", "uncertain"].includes(String(item.stop.state)) &&
+      integer(item.stop.expiresAt) && (item.stop.messageId === undefined || string(item.stop.messageId, 512))) &&
     (item.lastUpdatedAt === undefined || integer(item.lastUpdatedAt))) &&
     Object.entries(value.turns).every(([id, item]) => string(id) && object(item) && item.id === id &&
       string(item.conversationKey) && canonicalId(item.sessionId) && canonicalId(item.surfaceId) &&
@@ -108,7 +123,7 @@ function interaction(value: unknown): boolean {
 }
 
 function isState(value: unknown, owner: string): value is BridgeState {
-  if (!object(value) || (value.schema !== 1 && value.schema !== 2 && value.schema !== 3) || value.owner !== owner || typeof value.actionKey !== "string" ||
+  if (!object(value) || (value.schema !== 1 && value.schema !== 2 && value.schema !== 3 && value.schema !== 4) || value.owner !== owner || typeof value.actionKey !== "string" ||
     !/^[A-Za-z0-9_-]{43}$/.test(value.actionKey) || (value.controllerId !== undefined && !canonicalId(value.controllerId))) return false;
   if (!object(value.sessions) || !object(value.conversations) || !object(value.receipts) ||
     !Array.isArray(value.outbox) || !admissions(value.admissions) || !interaction(value.interaction)) return false;
@@ -121,6 +136,8 @@ function isState(value: unknown, owner: string): value is BridgeState {
     object(item) && string(item.id) && canonicalId(item.sessionId) && string(item.conversationKey) &&
     ["admitting", "accepted", "failed"].includes(String(item.status)) && typeof item.at === "number" &&
     (item.answered === undefined || typeof item.answered === "boolean") &&
+    (item.reference === undefined || object(item.reference)) &&
+    (item.parentTurnId === undefined || string(item.parentTurnId, 64)) &&
     (item.messageId === undefined || string(item.messageId, 512))))) return false;
   return Object.entries(value.sessions).every(([id, item]) =>
     object(item) && canonicalId(id) && item.id === id && string(item.name) &&
@@ -164,7 +181,8 @@ function isState(value: unknown, owner: string): value is BridgeState {
       (item.createdAt === undefined || Number.isSafeInteger(item.createdAt)) &&
       (item.originReference === undefined || object(item.originReference)) &&
       (item.publication === undefined || object(item.publication) && item.publication.version === 1 &&
-        string(item.publication.title, 512) && canonicalId(item.publication.surfaceId)) &&
+        string(item.publication.title, 512) && canonicalId(item.publication.surfaceId) &&
+        (item.publication.taskReceiptId === undefined || string(item.publication.taskReceiptId, 64))) &&
       (item.digest === undefined || object(item.digest) && item.digest.version === 1 && canonicalId(item.digest.surfaceId) &&
         Array.isArray(item.digest.memberIds) && item.digest.memberIds.length >= 3 && item.digest.memberIds.length <= 64 &&
         item.digest.memberIds.every((id) => string(id, 64))) &&
@@ -211,11 +229,11 @@ export class Store {
         if ((await stat(statePath)).size > 64 * 1024 * 1024) throw new Error("Bridge state exceeds the 64 MiB startup budget; inspect/archive it manually.");
         const parsed: unknown = JSON.parse(await readFile(statePath, "utf8"));
         if (!isState(parsed, owner)) throw new Error("State schema/owner mismatch; refusing to replace state.");
-        state = { ...parsed, schema: 3, admissions: parsed.admissions ?? {}, subscriptions: parsed.subscriptions ?? {}, directOrigins: parsed.directOrigins ?? {} };
+        state = { ...parsed, schema: 4, admissions: parsed.admissions ?? {}, subscriptions: parsed.subscriptions ?? {}, directOrigins: parsed.directOrigins ?? {} };
       } catch (error) {
         if (!object(error) || error.code !== "ENOENT") throw error;
         state = {
-          schema: 3, owner, actionKey: randomBytes(32).toString("base64url"),
+          schema: 4, owner, actionKey: randomBytes(32).toString("base64url"),
           sessions: {}, conversations: {}, receipts: {}, outbox: [], admissions: {}, subscriptions: {}, directOrigins: {},
         };
       }
@@ -224,6 +242,9 @@ export class Store {
       await store.mutate((draft) => {
         if (draft.interaction) {
           draft.interaction.active = {};
+          for (const steer of Object.values(draft.interaction.steers ?? {})) {
+            if (steer.state === "sending") steer.state = "uncertain";
+          }
           for (const route of Object.values(draft.interaction.routes ?? {})) {
             if (route.state === "sending") route.state = "uncertain";
             else if (route.state === "pending" && route.expiresAt <= Date.now()) route.state = "expired";
@@ -234,6 +255,13 @@ export class Store {
           for (const surface of Object.values(draft.interaction.surfaces)) {
             if (surface.delivery === "sending") surface.delivery = "uncertain";
             if (surface.kind === "request") surface.frozen = "Request interrupted by restart. Old responses are invalid.";
+            if (surface.kind === "stop") {
+              surface.frozen = surface.stop?.state === "uncertain"
+                ? "Stop outcome remains unconfirmed after restart. No stop was replayed."
+                : surface.stop?.state === "accepted" ? "Stop was acknowledged before restart; queued/background work is not inferred stopped."
+                  : "Stop confirmation expired on restart. No stop was replayed.";
+              if (surface.stop?.state === "pending") surface.stop.state = "cancelled";
+            }
             surface.revision++;
             surface.version++;
             surface.urgent = true;

@@ -5,7 +5,7 @@ import { Actions, isViewNavigation, StaleCardActionError, type ActionClaims } fr
 import { Cards, inputSuffix, latestTranscriptPage, sessionListPage } from "./cards.js";
 import type {
   Answer, AppAdmission, AppAdmissionSeed, BridgeOptions, Card, ConversationPreview, ConversationRecord, ModelChoice, Receipt, Runtime, RuntimeEvent,
-  SessionListView, SessionRecord, Settings, BridgeState, Subscription, OutboxItem, IncomingAddress, Outbound,
+  SessionListView, SessionRecord, Settings, BridgeState, Subscription, OutboxItem, IncomingAddress, Outbound, SendOptions,
 } from "./domain.js";
 import { appAdmissionNotice, appSessionCapability, isSessionListView, viewTarget } from "./domain.js";
 import type { TimelineEntry } from "./domain.js";
@@ -121,6 +121,7 @@ export class Bridge {
     await this.store.mutate((state) => {
       if (this.options.interaction) {
         const ui = interactionState(state);
+        ui.remoteApprovals = this.options.interaction.remoteApprovals !== false;
         ui.capabilityNotice = `Focus mode. Threads ${this.options.interaction.threads === "off" ? "disabled" : "unavailable on this validated transport"}; ` +
           `reactions ${this.options.interaction.reactions === "off" ? "disabled" : "unavailable"}. Native quoted replies are not enabled.`;
       }
@@ -425,6 +426,8 @@ export class Bridge {
       const admission: AppAdmission = {
         ...seed, conversationKey: key, receiptIds, phase: "accepted", observation: "watching",
         resultIds: [], checkedAt: seed.acceptedAt,
+        ...(state.interaction?.turns[receiptIds[0] ?? ""]?.reference
+          ? { reference: structuredClone(state.interaction.turns[receiptIds[0]!]!.reference) } : {}),
       };
       for (const id of receiptIds) {
         const receipt = state.receipts[id];
@@ -670,6 +673,64 @@ export class Bridge {
       await this.store.mutate((state) => { state.conversations[key]!.sideParentId = claims.targetId!; });
     }
     switch (claims.op) {
+      case "confirm-stop":
+      case "cancel-stop": {
+        assertFields(data, ["token"]);
+        const snapshot = this.store.snapshot();
+        const surface = snapshot.interaction?.surfaces[claims.surfaceId ?? ""];
+        if (surface?.kind !== "stop" || !surface.stop || surface.stop.state !== "pending" ||
+          surface.stop.expiresAt <= Date.now() || !surface.sessionId || surface.sessionId !== claims.targetId) {
+          throw new StaleCardActionError("This Stop confirmation expired or was already used.");
+        }
+        if (snapshot.sessions[surface.sessionId]?.kind !== "owned") throw new UserError("Only a bridge-owned working session can be stopped.");
+        if (claims.op === "cancel-stop") {
+          await this.store.mutate((state) => {
+            const current = state.interaction!.surfaces[surface.id]!;
+            current.stop!.state = "cancelled"; current.frozen = "Stop cancelled. No stop was sent.";
+            current.revision++; touchSurface(current, true);
+          });
+          return;
+        }
+        await this.store.mutate((state) => {
+          const current = state.interaction!.surfaces[surface.id]!;
+          current.stop!.state = "uncertain"; current.revision++; touchSurface(current, true);
+        });
+        try {
+          await this.runtime.stop(surface.sessionId, surface.stop.messageId);
+          await this.store.mutate((state) => {
+            const current = state.interaction!.surfaces[surface.id]!;
+            current.stop!.state = "accepted";
+            current.frozen = "Stop acknowledged. Await native events; queued or background work may remain.";
+            touchSurface(current, true);
+          });
+        } catch (error) {
+          const uncertain = error instanceof UncertainOperationError || !(error instanceof UserError);
+          await this.store.mutate((state) => {
+            const current = state.interaction!.surfaces[surface.id]!;
+            current.stop!.state = uncertain ? "uncertain" : "cancelled";
+            current.frozen = uncertain ? "Stop outcome is unconfirmed. Inspect the source; no stop is replayed."
+              : "Stop was not accepted. Review the current source before a new confirmation.";
+            touchSurface(current, true);
+          });
+          if (uncertain && !(error instanceof UncertainOperationError)) throw new UncertainOperationError("Stop outcome is unconfirmed. No stop will be replayed.");
+          throw error;
+        }
+        return;
+      }
+      case "steer": {
+        assertFields(data, ["token", "steering"]);
+        const state = this.store.snapshot();
+        const turn = state.interaction?.turns[claims.argument ?? ""];
+        if (!turn || turn.sessionId !== claims.targetId || turn.conversationKey !== key ||
+          state.interaction?.active[turn.sessionId] !== turn.id || turn.finishedAt ||
+          state.sessions[turn.sessionId]?.kind !== "owned" || !turn.messageId) {
+          throw new StaleCardActionError("Steer requires that same observed owned request. Nothing was sent.");
+        }
+        if (!string(data.steering, 64_000) || !data.steering.trim()) throw new UserError("Enter nonblank steering text.");
+        await this.sendWorking(key, turn.sessionId, data.steering, receiptIds, turn.reference,
+          { mode: "immediate", expectedMessageId: turn.messageId, parentTurnId: turn.id });
+        return;
+      }
       case "digest-page":
         assertFields(data, ["token"]);
         if (!claims.argument || !/^\d{1,4}$/u.test(claims.argument)) throw new UserError("Invalid digest page.");
@@ -884,6 +945,7 @@ export class Bridge {
       case "stop":
         assertFields(data, ["token"]);
         if (!targetId || claims.targetId !== targetId) throw new UserError("Stop action does not match the current session.");
+        if (this.options.interaction) { await this.requestStop(key, targetId); return; }
         await this.runtime.stop(targetId);
         await this.notice(key, "Stop request acknowledged. History and other sessions are preserved.");
         return;
@@ -930,6 +992,13 @@ export class Bridge {
         if (target.kind !== "owned" && target.kind !== "controller") throw new UserError("Peer messages cannot answer human approval requests.");
         const pending = target.pending.find((item) => item.id === claims.requestId);
         if (!pending) throw new UserError("This native request is no longer pending.");
+        if (pending.kind === "form") throw new UserError("Structured forms are unavailable here. No response is inferred; use the original native UI.");
+        if ((pending.kind === "permission" || pending.kind === "plan") && this.options.interaction?.remoteApprovals === false) {
+          throw new UserError("Remote permission/plan approvals are disabled. No approval was sent.");
+        }
+        if (pending.responseState || pending.expiresAt !== undefined && pending.expiresAt <= Date.now()) {
+          throw new StaleCardActionError("This response was already submitted or expired. No response was repeated.");
+        }
         const suffix = inputSuffix(pending.id);
         const choiceField = `choice_${suffix}`;
         const textField = `text_${suffix}`;
@@ -940,8 +1009,10 @@ export class Bridge {
         if (text !== undefined && (typeof text !== "string" || text.length > 4000)) throw new UserError("Malformed answer.");
         const choice = typeof value === "string" && value !== "" ? Number(value) : undefined;
         if (choice !== undefined && pending.choices[choice] === undefined) throw new UserError("Choice is not part of this native request.");
-        const accept = claims.argument === "accept";
+        const accept = claims.argument === "accept" || pending.kind === "permission" && claims.argument === "session";
         if (!accept && claims.argument !== "decline") throw new UserError("Unknown approval decision.");
+        if (accept && pending.kind !== "input" && pending.detailsComplete === false) throw new UserError("Complete approval details are unavailable. Remote Allow is forbidden.");
+        if (claims.argument === "session" && !pending.canApproveSession) throw new UserError("This request offers no session-wide approval.");
         if (pending.kind === "input" && accept && choice === undefined && (!pending.allowFreeform || !string(text, 4000))) {
           throw new UserError("Answer using a native choice or permitted freeform text.");
         }
@@ -949,10 +1020,21 @@ export class Bridge {
           ...(choice === undefined ? {} : { choice }),
           ...(typeof text === "string" ? { text } : {}),
           ...(pending.kind === "input" ? (!accept ? { skip: true } : {}) : { approve: accept }),
+          ...(pending.kind === "permission" && this.options.interaction ? {
+            permission: claims.argument === "session" ? "session" as const : accept ? "once" as const : "deny" as const,
+          } : {}),
         };
         await this.runtime.answer(targetId, pending.id, answer);
         await this.store.mutate((state) => {
-          state.sessions[targetId]!.pending = state.sessions[targetId]!.pending.filter((item) => item.id !== pending.id);
+          if (this.options.interaction) {
+            const current = state.sessions[targetId]!.pending.find((item) => item.id === pending.id);
+            if (current) current.responseState = "submitted";
+            for (const surface of Object.values(state.interaction!.surfaces)) {
+              if (surface.sessionId === targetId && (surface.kind === "header" || surface.requestId === pending.id) && !surface.frozen) {
+                surface.revision++; touchSurface(surface, true);
+              }
+            }
+          } else state.sessions[targetId]!.pending = state.sessions[targetId]!.pending.filter((item) => item.id !== pending.id);
           state.conversations[key]!.revision++;
         });
         await this.notice(key, "Response accepted for that exact native request. Waiting for the native completion event.");
@@ -1057,6 +1139,7 @@ export class Bridge {
           return;
         case "stop":
           if (!conversation.selectedId) return this.promptSelection(key);
+          if (this.options.interaction) { await this.requestStop(key, conversation.selectedId); return; }
           await this.runtime.stop(conversation.selectedId);
           await this.notice(key, "Stop request acknowledged. Other sessions are unaffected.");
           return;
@@ -1099,8 +1182,9 @@ export class Bridge {
     }
   }
 
-  private async sendWorking(key: string, id: string, text: string, receiptIds: string[], origin?: ConversationReference): Promise<void> {
-    if (this.store.snapshot().conversations[key]?.selectionBlocked) {
+  private async sendWorking(key: string, id: string, text: string, receiptIds: string[], origin?: ConversationReference, delivery?: SendOptions): Promise<void> {
+    const steering = delivery?.mode === "immediate";
+    if (!steering && this.store.snapshot().conversations[key]?.selectionBlocked) {
       throw new UserError("Destination unresolved after an unsuccessful !use. New work is blocked; choose a valid source with !use <canonical ID>. The previous selection was preserved, not used.");
     }
     const target = this.store.snapshot().sessions[id];
@@ -1119,17 +1203,31 @@ export class Bridge {
     if (target.peerSource !== "app") {
       await this.store.mutate((state) => {
         const records = Object.values(state.directOrigins);
-        if (records.filter((item) => item.status !== "failed" && !item.answered).length >= 64) throw new UserError("Too many unconfirmed direct responses. No new task was sent.");
+        if (!steering && records.filter((item) => item.status !== "failed" && !item.answered && !item.parentTurnId).length >= 64) throw new UserError("Too many unconfirmed direct responses. No new task was sent.");
         if (records.length >= 1000) {
           const oldest = records.filter((item) => item.answered || item.status === "failed").sort((a, b) => a.at - b.at)[0];
           if (oldest) delete state.directOrigins[oldest.id];
         }
-        state.directOrigins[originId] = { id: originId, sessionId: id, conversationKey: key, status: "admitting", at: Date.now() };
-        if (this.options.interaction) startTurn(state, key, id, originId, origin);
+        state.directOrigins[originId] = { id: originId, sessionId: id, conversationKey: key, status: "admitting", at: Date.now(),
+          ...(this.options.interaction ? { reference: structuredClone(origin ?? state.conversations[key]!.reference) } : {}),
+          ...(steering && delivery.parentTurnId ? { parentTurnId: delivery.parentTurnId } : {}) };
+        if (this.options.interaction) {
+          if (steering) {
+            const parent = state.interaction?.turns[delivery.parentTurnId ?? ""];
+            if (!parent || parent.sessionId !== id || parent.conversationKey !== key || state.interaction?.active[id] !== parent.id) {
+              throw new StaleCardActionError("The steering target changed. Nothing was sent.");
+            }
+            (state.interaction!.steers ??= {})[originId] = {
+              id: originId, sessionId: id, conversationKey: key, parentTurnId: parent.id, at: Date.now(), state: "sending",
+            };
+            touchSurface(state.interaction!.surfaces[parent.surfaceId]!, true);
+          } else startTurn(state, key, id, originId, origin);
+        }
       });
       gate = new Promise<void>((resolve) => { acknowledge = resolve; });
       this.directAcks.set(id, gate);
     }
+    if (this.options.interaction) this.schedule(key);
     if (!gate && this.options.interaction) {
       await this.store.mutate((state) => { startTurn(state, key, id, originId, origin); });
       gate = new Promise<void>((resolve) => { acknowledge = resolve; });
@@ -1139,19 +1237,29 @@ export class Bridge {
     let accepted = false;
     try {
       result = await this.runtime.send(id, text, target.peerSource === "app"
-        ? (seed) => this.persistAppAdmission(key, id, receiptIds, seed) : undefined);
+        ? (seed) => this.persistAppAdmission(key, id, receiptIds, seed) : undefined, delivery);
       accepted = true;
       if (gate) await this.store.mutate((state) => {
         const origin = state.directOrigins[originId];
         if (origin) { origin.messageId = result.id; origin.status = "accepted"; }
         const turn = state.interaction?.turns[originId];
         if (turn) { turn.messageId = result.id; setTurnState(state, turn, "accepted"); }
+        const steer = state.interaction?.steers?.[originId];
+        if (steer) {
+          steer.messageId = result.id; steer.state = "accepted";
+          touchSurface(state.interaction!.surfaces[state.interaction!.turns[steer.parentTurnId]!.surfaceId]!, true);
+        }
       });
     } catch (error) {
       if (gate) await this.store.mutate((state) => {
         if (!accepted && state.directOrigins[originId]) state.directOrigins[originId]!.status = "failed";
         const turn = state.interaction?.turns[originId];
         if (turn) setTurnState(state, turn, accepted || error instanceof UncertainOperationError ? "uncertain" : "failed");
+        const steer = state.interaction?.steers?.[originId];
+        if (steer) {
+          steer.state = accepted || error instanceof UncertainOperationError ? "uncertain" : "rejected";
+          touchSurface(state.interaction!.surfaces[state.interaction!.turns[steer.parentTurnId]!.surfaceId]!, true);
+        }
       });
       if (accepted) throw new UncertainOperationError("Task may be accepted but direct-response binding could not be persisted. No replay was attempted.");
       throw error;
@@ -1172,12 +1280,13 @@ export class Bridge {
         const receipt = state.receipts[receiptId];
         if (receipt) receipt.sessionId = id;
       }
-      if (!result.peer) session.status = "busy";
+      if (!result.peer && !state.interaction?.turns[originId]?.finishedAt) session.status = "busy";
       const conversation = state.conversations[key]!;
       conversation.read[id] ??= session.sequence;
       conversation.notice = result.peer
         ? "Peer owner accepted the exact message. Acceptance is not Teams delivery or task completion; supported result observation continues in the background. Approvals remain in its owner."
-        : `Native message ${result.id} admitted. Work continues independently of the selected view.`;
+        : steering ? `Steering message ${result.id} accepted. Consumption/completion is not implied; native-origin results keep the original recipient.`
+          : `Native message ${result.id} admitted. Work continues independently of the selected view.`;
     });
   }
 
@@ -1311,6 +1420,24 @@ export class Bridge {
     if (failure && mode === "explicit") throw new UserError(detail);
   }
 
+  private async requestStop(key: string, sessionId: string): Promise<void> {
+    await this.store.mutate((state) => {
+      const source = state.sessions[sessionId];
+      if (source?.kind !== "owned" || source.status === "offline") {
+        throw new UserError("Stop requires a live bridge-owned working session. App/foreign sessions remain under their original host.");
+      }
+      const ui = interactionState(state);
+      const active = ui.turns[ui.active[sessionId] ?? ""];
+      const surface = newSurface(state, key, "stop", { sessionId,
+        ...(active?.conversationKey === key ? { turnId: active.id } : {}) });
+      surface.stop = {
+        state: "pending", expiresAt: Date.now() + (this.options.actionTtlMs ?? 15 * 60_000),
+        ...(active?.messageId ? { messageId: active.messageId } : {}),
+      };
+      state.conversations[key]!.notice = "Confirm Stop on its separate card. No stop has been sent yet.";
+    });
+    this.schedule(key);
+  }
   private async captureRoute(key: string, prompt: string, receiptId: string, reference: ConversationReference): Promise<void> {
     await this.store.mutate((state) => {
       const ui = interactionState(state);
@@ -1429,6 +1556,21 @@ export class Bridge {
     for (const route of expired) this.schedule(route.conversationKey);
   }
 
+  private async expireStops(): Promise<void> {
+    const expired = Object.values(this.store.snapshot().interaction?.surfaces ?? {}).filter((surface) =>
+      surface.kind === "stop" && surface.stop?.state === "pending" && surface.stop.expiresAt <= Date.now());
+    if (!expired.length) return;
+    await this.store.mutate((state) => {
+      for (const previous of expired) {
+        const surface = state.interaction!.surfaces[previous.id]!;
+        if (surface.stop?.state !== "pending" || surface.stop.expiresAt > Date.now()) continue;
+        surface.stop.state = "cancelled"; surface.frozen = "Stop confirmation expired. No stop was sent.";
+        surface.revision++; touchSurface(surface, true);
+      }
+    });
+    for (const surface of expired) this.schedule(surface.conversationKey);
+  }
+
   private async expireFollows(): Promise<void> {
     if (!this.options.interaction) return;
     const expired = Object.values(this.store.snapshot().interaction?.follows ?? {}).filter((entry) =>
@@ -1490,6 +1632,8 @@ export class Bridge {
     const state = this.store.snapshot();
     const now = Date.now();
     const times = [
+      ...Object.values(state.interaction?.surfaces ?? {}).flatMap((surface) =>
+        surface.stop?.state === "pending" ? [surface.stop.expiresAt] : []),
       ...Object.values(state.interaction?.routes ?? {}).flatMap((route) => route.state === "pending" ? [route.expiresAt] : []),
       ...Object.values(state.interaction?.follows ?? {}).flatMap((entry) =>
         entry.mode === "automatic" && entry.expiresAt !== undefined ? [entry.expiresAt] : []),
@@ -1877,12 +2021,17 @@ export class Bridge {
       const id = digest(`${key}:${sessionId}:${final.id}:0`);
       const origin = claim.originatingMessageId ?? (claim.admissionId ? state.admissions[claim.admissionId]?.messageId : undefined);
       const turn = turnForOrigin(state, sessionId, origin);
+      const directOrigin = Object.values(state.directOrigins).find((entry) =>
+        entry.sessionId === sessionId && entry.conversationKey === key && entry.messageId === origin && entry.status === "accepted");
+      const reference = turn?.reference ?? directOrigin?.reference ??
+        (claim.admissionId ? state.admissions[claim.admissionId]?.reference : undefined);
       const surface = newSurface(state, key, "result", { sessionId, outboxId: id, ...(turn ? { turnId: turn.id } : {}) });
       state.outbox.push({
         id, conversationKey: key, sessionId, eventId: final.id, text: final.text,
         status: "pending", createdAt: Date.now(), ...claim,
-        publication: { version: 1, title: safeText(sourceTitle(session, state.sessions), 440), surfaceId: surface.id },
-        ...(claim.direct && turn ? { originReference: structuredClone(turn.reference) } : {}),
+        publication: { version: 1, title: safeText(sourceTitle(session, state.sessions), 440), surfaceId: surface.id,
+          ...(turn || directOrigin?.parentTurnId ? { taskReceiptId: turn?.id ?? directOrigin!.parentTurnId! } : {}) },
+        ...(claim.direct && reference ? { originReference: structuredClone(reference) } : {}),
       });
       return;
     }
@@ -2154,6 +2303,7 @@ export class Bridge {
     if (!this.deliveryEnabled) return;
     await this.expireFollows();
     await this.expireRoutes();
+    await this.expireStops();
     const keys = [...this.dirty];
     this.dirty.clear();
     for (const key of keys) {
@@ -2396,10 +2546,14 @@ export class Bridge {
           await this.sendWorking(key, parameters.sessionId, parameters.text, [receiptId]);
           return { accepted: true, sessionId: parameters.sessionId, completed: false };
         }),
-      tool("bridge_stop", "Stop the current turn of a bridge-owned working session, preserving history.",
-        { sessionId: { type: "string" } }, ["sessionId"], async (_key, parameters) => {
+      tool("bridge_stop", "Request an owner-confirmed stop of a bridge-owned working session, preserving history.",
+        { sessionId: { type: "string" } }, ["sessionId"], async (key, parameters) => {
           if (!canonicalId(parameters.sessionId) || this.store.snapshot().sessions[parameters.sessionId]?.kind !== "owned") {
             throw new UserError("Stop requires a bridge-owned canonical working-session ID.");
+          }
+          if (this.options.interaction) {
+            await this.requestStop(key, parameters.sessionId);
+            return { confirmationRequired: true, stopAcknowledged: false };
           }
           await this.runtime.stop(parameters.sessionId);
           return { stopAcknowledged: true };

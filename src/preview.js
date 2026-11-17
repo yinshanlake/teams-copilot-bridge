@@ -223,7 +223,7 @@ document.querySelector("#composer").addEventListener("submit", async (event) => 
   try { await sendActivity(text); } catch (failure) { showError(failure.message); }
 });
 document.querySelector("#payload-toggle").addEventListener("click", () => { payload.hidden = !payload.hidden; });
-for (const name of ["ask", "permission", "plan", "background", "long", "error"]) {
+for (const name of ["ask", "permission", "plan", "form", "background", "long", "error"]) {
   const button = element("button", name);
   button.type = "button";
   button.addEventListener("click", () => {

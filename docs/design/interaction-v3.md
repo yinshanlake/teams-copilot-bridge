@@ -68,6 +68,42 @@ four-source/64-publication case with both Submit and Execute, 66 distinct source
 with a two-source remainder, and injected final-payload oversize.
 Phase 2 build/typecheck, all 290 offline tests, and the public-source audit passed.
 
+Phase 3 adds owned controls without expanding existing-App authority. All pinned
+permission kinds keep manual handling; the controller still denies execution.
+True off returns user-not-available for permissions and declines plans, with
+backend and UI guards. Permission/plan deadlines default to 15 minutes. Displayed
+approval details are redacted; incomplete/unrenderable details cannot be allowed.
+Session grants are restricted to explicit native command/write scopes; managed
+one-shot/sandbox-escalation requests, foreign owning-host requests, and
+permanent/location grants cannot use that path. Native request completion, not
+an inferred answer or mere button click, dismisses pending state.
+
+Stop now has a separate, durable owner confirmation for commands, cards and the
+Control tool. The native API still aborts the currently processing message, not
+an atomically addressed entire queue; ACK/uncertainty and remaining background
+work are stated explicitly. Steer uses immediate only for an observed owned
+root, retains its original recipient, and records a control receipt rather than
+inventing an independently completed task. Normal sends explicitly enqueue.
+Unknown send/stop ACK outcomes never become definite failure/retry permission.
+
+Elicitation takes the documented unavailable fallback: no form handler is
+registered, so this client neither advertises unsupported form capabilities nor
+steals another client's first response. Authoritative owned SDK form events may
+show a read-only needs-you notice; exact native completion clears it. No matching
+by text/order, App callback enrollment, remote App answer, or endpoint change is
+introduced. The default legacy question handler and exact plan actions remain.
+
+Final control-state format is schema 4, accepting validated 1/2/3 data and
+preserving all old source/cursor/receipt/outbox identities and payload bytes.
+Older readers reject it rather than silently ignore Stop/approval state. Pending
+controls are invalidated across restart, uncertain outcomes remain uncertain,
+and no accepted task or decision is replayed. Backout after new acceptance must
+retain the schema-aware state; an old database restore is not a safe downgrade.
+Phase 3 build/typecheck and all 303 offline tests passed, including every
+cold-review regression. The final source audit and all four Windows package
+checks passed. Runtime/tenant preview gates remain deliberately unverified;
+these offline results do not authorize deployment or certify real Teams/SDK use.
+
 ## Historical design evidence
 
 Status: **proposal for owner review; no feature implementation**.

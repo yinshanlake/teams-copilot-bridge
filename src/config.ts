@@ -97,7 +97,18 @@ export function interactionConfiguration(environment: NodeJS.ProcessEnv): Intera
     followMs: duration("BRIDGE_FOLLOW_HOURS", 24, 1, 3_600_000),
     digestMs: 60_000,
     threads: preview("BRIDGE_THREADS"), reactions: preview("BRIDGE_REACTIONS"),
+    ...approvalConfiguration(environment),
   };
+}
+
+function approvalConfiguration(environment: NodeJS.ProcessEnv): { remoteApprovals: boolean; approvalTimeoutMs: number } {
+  const approval = environment.BRIDGE_REMOTE_APPROVALS ?? "on";
+  if (approval !== "on" && approval !== "off") throw new UserError("BRIDGE_REMOTE_APPROVALS must be on or off.");
+  const minutes = Number(environment.BRIDGE_APPROVAL_TIMEOUT_MINUTES ?? "15");
+  if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes * 60_000 > 2_000_000_000) {
+    throw new UserError("BRIDGE_APPROVAL_TIMEOUT_MINUTES must be a positive integer within the supported timer range.");
+  }
+  return { remoteApprovals: approval === "on", approvalTimeoutMs: minutes * 60_000 };
 }
 
 export function botStateDirectory(environment: NodeJS.ProcessEnv, botAppId: string, cwd: string): string {
@@ -141,6 +152,7 @@ export function nativeConfiguration(environment: NodeJS.ProcessEnv, stateDirecto
       ? resolve(cwd, environment.COPILOT_PEER_CONFIG_DIRECTORY) : resolve(stateDirectory, "native"),
     defaultModel: catalogueOnly ? "" : environment.COPILOT_DEFAULT_MODEL ?? "",
     peers: environment.COPILOT_ENABLE_PEERS === "true",
+    ...approvalConfiguration(environment),
     ...(!catalogueOnly && appSessions === "true" ? {
       appSessions: {
         timeoutMs: endpointTimeout,

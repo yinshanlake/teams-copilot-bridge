@@ -267,10 +267,10 @@ before any member is claimed. Remainders stay queued rather than being lost.
 update immediately. `BRIDGE_FOLLOW_HOURS` defaults to 24 (minimum 1). Values must
 fit the validated timer range. Rendering cards and following do not start an SDK.
 
-The Store now writes **schema 3**. Opening schema 1 or 2 validates the same owner and
+The Store now writes **schema 4**. Opening schema 1, 2 or 3 validates the same owner and
 atomically preserves its sources, receipts, admissions, subscription cursors and
-all legacy outbox bytes/statuses. Earlier readers reject schema 3 rather than
-ignore the new routing/alias semantics. A controlled
+all legacy outbox bytes/statuses. Earlier readers reject schema 4 rather than
+ignore new routing, approval and confirmation semantics. A controlled
 upgrade must stop the single writer and retain a consistent private backup.
 After any newly accepted work, restoring an older database is **not a safe
 rollback**: it can lose deduplication and receipt facts. Retain the schema-aware
@@ -299,6 +299,38 @@ The optional remembered-target UI and persistent session-thread bindings are
 withheld until actual thread support is verified; Focus keeps its explicit
 visible selection instead. Current headers update independently of Inbox
 navigation, and older Focus headers are frozen without cancelling their tasks.
+
+### Owned-session controls
+
+Bridge-created working sessions keep **manual permissions**. Permission cards
+show redacted command/file/tool details, **Allow once**, **Deny** with optional
+feedback, and **Allow for this session** only for native-advertised command/write
+scopes. Managed one-shot or sandbox-escalation requests cannot receive a broader
+grant. Oversized/incomplete approval details disable Allow rather than approve
+unseen work. No permanent/location grant is offered. Questions keep their exact
+native choices; plan approval keeps the actual offered continuation actions.
+
+`BRIDGE_REMOTE_APPROVALS=off` genuinely disables new remote permission and plan
+approvals: permissions return `user-not-available`, plans decline, and no Allow
+controls are offered. It does not revoke a previous native grant, stop work, or
+turn on `allow-all`. With approvals on, `BRIDGE_APPROVAL_TIMEOUT_MINUTES` defaults
+to 15; expired permissions return `user-not-available` and plans decline.
+RPC uncertainty is shown honestly, without retrying an approval or a prompt.
+
+**Stop**, including `!stop` and Control's stop tool, requires a separate owner
+confirmation. It targets the currently processing message in the exact owned
+session; queued/background work may remain. **Steer** on an observed owned turn
+sends unchanged text with `immediate`; ordinary work uses `enqueue`. A steering
+ACK is not consumption or a separate completed task. Native-origin results retain
+the original task address, even after changing Focus. Existing App sessions never
+gain Stop, remote approval, mode/model changes or takeover.
+
+Structured forms remain **unavailable** in the pinned remote UI. The public
+elicitation callback omits its request ID, so the bridge does not enroll a
+misleading form capability or guess correspondence by text/order. An observed
+form is a read-only needs-you notice for the original native UI; it cannot be
+answered from the composer or an approval card. Its actual native completion
+clears the notice. This also avoids preempting another client's first response.
 
 ## Private state and operational limits
 

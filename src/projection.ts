@@ -19,6 +19,45 @@ function isFinalPhase(phase: string | undefined): boolean {
   return phase === "final" || phase === "final_answer" || phase === "response";
 }
 
+function approvalDetails(raw: Record<string, unknown>, prompt: Record<string, unknown>): Pick<PendingRequest, "details" | "detailsComplete" | "canApproveSession"> {
+  let details: string;
+  const kind = raw.kind;
+  if (kind === "shell") {
+    if (typeof raw.fullCommandText !== "string" || raw.fullCommandText.length > 32_000) {
+      return { details: "The complete command cannot be displayed safely. Remote Allow is unavailable; use Deny or the original host.", detailsComplete: false };
+    }
+    details = raw.fullCommandText;
+    if (raw.requestSandboxBypass === true) details += raw.requestSandboxPermissive === true
+      ? "\nSandbox permissive retry requested; network restrictions remain."
+      : "\nThis request asks to run outside the sandbox.";
+    if (typeof raw.warning === "string") details += `\nWarning: ${raw.warning}`;
+  } else if (kind === "write") {
+    const paths = new Set<string>();
+    if (typeof raw.fileName === "string") paths.add(raw.fileName);
+    for (const edit of Array.isArray(raw.fileEdits) ? raw.fileEdits : []) if (object(edit)) {
+      for (const side of [edit.before, edit.after]) if (object(side) && typeof side.path === "string") paths.add(side.path);
+    }
+    if (!paths.size || paths.size > 20) return { details: "The complete file list is unavailable or too large. Remote Allow is unavailable.", detailsComplete: false };
+    details = `Files:\n${[...paths].join("\n")}\n\nDiff summary:\n` +
+      (typeof raw.diff === "string" && raw.diff.length <= 64_000 ? safeText(raw.diff, 3000) : "Diff preview unavailable; inspect the original host.");
+  } else if (["read", "url", "mcp", "memory", "custom-tool", "hook", "extension-management", "workflow", "extension-permission-access", "extension-env-access"].includes(String(kind))) {
+    const fields = ["kind", "intention", "path", "url", "serverName", "toolName", "args", "subject", "fact", "reason",
+      "toolDescription", "hookMessage", "toolArgs", "operation", "extensionName", "approvalKey"];
+    details = JSON.stringify(Object.fromEntries(fields.filter((field) => raw[field] !== undefined).map((field) => [field, raw[field]])), null, 2);
+  } else return { details: "Unsupported permission details. Remote Allow is unavailable.", detailsComplete: false };
+  if (details.length > 32_000) return { details: "Permission details exceed the safe display budget. Remote Allow is unavailable.", detailsComplete: false };
+  const redacted = safeText(details, Number.MAX_SAFE_INTEGER);
+  const display = `${redacted}${redacted !== details ? "\n[Sensitive values are masked.]" : ""}`;
+  const literalBytes = Buffer.byteLength(JSON.stringify(display.replace(/[\\`*_{}\[\]()#+.!|<>~&=-]/gu, "\\$&")));
+  if (literalBytes > 12_000) return { details: "Complete permission details do not fit a Teams card. Remote Allow is unavailable.", detailsComplete: false };
+  return {
+    details: display, detailsComplete: true,
+    canApproveSession: (kind === "shell" || kind === "write") && raw.canOfferSessionApproval === true &&
+      raw.managedApprovalRequired !== true && prompt.managedApprovalRequired !== true &&
+      raw.requestSandboxBypass !== true && prompt.requestSandboxBypass !== true,
+  };
+}
+
 export function visibleUserContent(data: Record<string, unknown>): string | undefined {
   if (data.isAutopilotContinuation === true ||
     (typeof data.source === "string" && /^(?:skill-|agent-)/u.test(data.source))) return undefined;
@@ -106,8 +145,12 @@ export class Projector {
         upsert({ id: `request:${pending.id}`, kind: pending.kind, text: pending.title, state: "skipped" });
         return;
       }
-      if (!record.pending.some((item) => item.id === pending.id)) {
+      const current = record.pending.findIndex((item) => item.id === pending.id);
+      if (current < 0) {
         record.pending.push(pending);
+        requestChanged = true;
+      } else if (JSON.stringify(record.pending[current]) !== JSON.stringify(pending)) {
+        record.pending[current] = pending;
         requestChanged = true;
       }
       record.status = "awaiting";
@@ -209,22 +252,69 @@ export class Projector {
         break;
       case "permission.requested": {
         if (data.resolvedByHook === true || !string(data.requestId)) break;
+        if (data.bridgeRemoteApprovalAllowed === false) {
+          append("status", data.bridgeApprovalUnavailableReason === "owning-host"
+            ? "This permission belongs to an unsupported owning host. Respond there; no remote approval is offered."
+            : "Remote execution approvals are disabled. The native policy is declining this request; no owner approval was offered.");
+          break;
+        }
         const raw = object(data.permissionRequest) ? data.permissionRequest : {};
+        const prompt = object(data.promptRequest) ? data.promptRequest : {};
         const kind = typeof raw.kind === "string" && /^[\w-]{1,40}$/.test(raw.kind) ? raw.kind : "tool";
         request({
           id: data.requestId, kind: "permission",
           title: `Approval required: ${kind}. ` + text(raw.intention, "Arguments/output withheld. Approve once only.", 400),
-          choices: [], allowFreeform: false,
+          choices: [], allowFreeform: true, ...approvalDetails(raw, prompt),
+          ...(Number.isSafeInteger(data.bridgeApprovalExpiresAt) ? { expiresAt: Number(data.bridgeApprovalExpiresAt) } : {}),
         });
         break;
       }
-      case "exit_plan_mode.requested":
+      case "exit_plan_mode.requested": {
+        if (data.bridgeRemoteApprovalAllowed === false) {
+          append("status", "Remote plan approvals are disabled. A native decline is being submitted.");
+          break;
+        }
+        const plan = typeof data.planContent === "string" && data.planContent.length <= 32_000 ? safeText(data.planContent, 8000)
+          : typeof data.planContent === "string" ? "The plan exceeds the safe display budget. Review it in the original host." : "";
+        const complete = typeof data.planContent !== "string" || (data.planContent.length <= 8000 &&
+          Buffer.byteLength(JSON.stringify(plan.replace(/[\\`*_{}\[\]()#+.!|<>~&=-]/gu, "\\$&"))) <= 12_000);
         if (string(data.requestId)) request({
           id: data.requestId, kind: "plan",
-          title: text(data.summary, "Review the proposed plan", 2000) + "\n" + text(data.planContent, "", 3000),
+          title: text(data.summary, "Review the proposed plan", 2000),
+          details: plan,
+          detailsComplete: complete,
           choices: strings(data.actions), allowFreeform: true,
+          ...(Number.isSafeInteger(data.bridgeApprovalExpiresAt) ? { expiresAt: Number(data.bridgeApprovalExpiresAt) } : {}),
         });
         break;
+      }
+      case "elicitation.requested":
+        if (string(data.requestId)) request({
+          id: data.requestId, kind: "form", title: text(data.message, "Structured input requested", 1000),
+          details: "Structured forms are unavailable here. No callback is registered and no response is inferred. Use the original native UI.",
+          detailsComplete: false, choices: [], allowFreeform: false,
+        });
+        break;
+      case "elicitation.completed":
+        completed("form", data.action === "accept" ? "answered" : "skipped");
+        break;
+      case "bridge.permission_resolved":
+        completed("permission", data.outcome === "once" || data.outcome === "session" ? "answered" : "skipped");
+        break;
+      case "bridge.approval_unconfirmed":
+      case "bridge.approval_timeout_submitted": {
+        const pending = record.pending.find((entry) => entry.id === data.requestId);
+        if (pending) {
+          pending.expiresAt = Date.now();
+          pending.detailsComplete = false;
+          pending.responseState = "unconfirmed";
+          requestChanged = true;
+        }
+        append("status", event.type === "bridge.approval_unconfirmed"
+          ? "Approval expiry could not be confirmed by the native host. No approval was given; use Stop or inspect the host."
+          : "Plan timeout submitted a decline. Awaiting native confirmation.");
+        break;
+      }
       case "user_input.completed":
         completed("input", typeof data.answer === "string" ? "answered" : "skipped");
         break;

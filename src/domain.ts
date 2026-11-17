@@ -42,10 +42,15 @@ export interface SettingsResult {
 
 export interface PendingRequest {
   id: string;
-  kind: "input" | "permission" | "plan";
+  kind: "input" | "permission" | "plan" | "form";
   title: string;
   choices: string[];
   allowFreeform: boolean;
+  details?: string;
+  detailsComplete?: boolean;
+  canApproveSession?: boolean;
+  expiresAt?: number;
+  responseState?: "submitted" | "unconfirmed";
 }
 
 export interface Answer {
@@ -53,11 +58,18 @@ export interface Answer {
   text?: string;
   approve?: boolean;
   skip?: boolean;
+  permission?: "once" | "session" | "deny";
+}
+
+export interface SendOptions {
+  mode: "enqueue" | "immediate";
+  expectedMessageId?: string;
+  parentTurnId?: string;
 }
 
 export interface TimelineEntry {
   id: string;
-  kind: "user" | "assistant" | "tool" | "agent" | "input" | "permission" | "plan" | "task" | "error" | "status";
+  kind: "user" | "assistant" | "tool" | "agent" | "input" | "permission" | "plan" | "form" | "task" | "error" | "status";
   text: string;
   timestamp?: string;
   phase?: "commentary" | "final";
@@ -188,6 +200,7 @@ export interface AppAdmission extends AppAdmissionSeed {
   checkedAt: number;
   executionIndex?: number;
   completionIndex?: number;
+  reference?: ConversationReference;
 }
 
 export function appAdmissionNotice(admission: AppAdmission): string {
@@ -220,7 +233,7 @@ export interface OutboxItem {
   historyId?: string;
   createdAt?: number;
   follow?: { id: string; revision: number };
-  publication?: { version: 1; title: string; surfaceId: string };
+  publication?: { version: 1; title: string; surfaceId: string; taskReceiptId?: string };
   digest?: { version: 1; memberIds: string[]; surfaceId: string };
   digestId?: string;
   originReference?: ConversationReference;
@@ -232,6 +245,8 @@ export interface InteractionOptions {
   digestMs?: number;
   threads?: "auto" | "off";
   reactions?: "auto" | "off";
+  remoteApprovals?: boolean;
+  approvalTimeoutMs?: number;
 }
 
 export interface FollowPreference {
@@ -245,7 +260,7 @@ export interface FollowPreference {
   detail: string;
 }
 
-export type InteractionSurfaceKind = "inbox" | "header" | "turn" | "request" | "result" | "digest" | "routing";
+export type InteractionSurfaceKind = "inbox" | "header" | "turn" | "request" | "result" | "digest" | "routing" | "stop";
 
 export interface RoutingIntent {
   id: string;
@@ -284,6 +299,18 @@ export interface InteractionSurface {
   frozen?: string;
   retryAt?: number;
   page?: number;
+  requestHash?: string;
+  stop?: { state: "pending" | "accepted" | "cancelled" | "uncertain"; expiresAt: number; messageId?: string };
+}
+
+export interface SteeringReceipt {
+  id: string;
+  sessionId: string;
+  conversationKey: string;
+  parentTurnId: string;
+  at: number;
+  state: "sending" | "accepted" | "uncertain" | "rejected";
+  messageId?: string;
 }
 
 export interface InteractionTurn {
@@ -311,6 +338,8 @@ export interface InteractionState {
   aliases?: Record<string, string>;
   routes?: Record<string, RoutingIntent>;
   capabilityNotice?: string;
+  remoteApprovals?: boolean;
+  steers?: Record<string, SteeringReceipt>;
 }
 
 export interface JournalCursor {
@@ -336,10 +365,12 @@ export interface DirectOrigin {
   id: string; sessionId: string; conversationKey: string; messageId?: string;
   status: "admitting" | "accepted" | "failed"; at: number;
   answered?: boolean;
+  reference?: ConversationReference;
+  parentTurnId?: string;
 }
 
 export interface BridgeState {
-  schema: 1 | 2 | 3;
+  schema: 1 | 2 | 3 | 4;
   owner: string;
   actionKey: string;
   controllerId?: string;
@@ -378,10 +409,10 @@ export interface Runtime {
   appLiveness(): Promise<AppSessionLiveness[]>;
   create(options: CreateOptions): Promise<Settings>;
   resume(record: SessionRecord, tools?: Tool<unknown>[]): Promise<Settings>;
-  send(id: string, text: string, persistAdmission?: (admission: AppAdmissionSeed) => Promise<void>): Promise<{ id: string; peer: boolean }>;
+  send(id: string, text: string, persistAdmission?: (admission: AppAdmissionSeed) => Promise<void>, options?: SendOptions): Promise<{ id: string; peer: boolean }>;
   reconcileAdmissions(admissions: AppAdmission[]): Promise<void>;
   settleAdmission(admissionId: string): void;
-  stop(id: string): Promise<void>;
+  stop(id: string, expectedMessageId?: string): Promise<void>;
   settings(id: string): Promise<Settings>;
   models(id: string): Promise<ModelChoice[]>;
   configure(id: string, change: SettingsChange): Promise<SettingsResult>;

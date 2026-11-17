@@ -129,6 +129,10 @@ function sessionStatus(session: SessionRecord, now: number): SessionAppearance {
     return status("Status unavailable", "Warning", "?", true);
   }
   if (session.status === "offline" && session.peerSource !== "app" && session.kind !== "saved" && session.kind !== "unavailable") return status("Not connected", "Default", "○");
+  if (session.pending.some((pending) => pending.responseState === "submitted")) return status("Response submitted - native confirmation pending", "Warning", "?", true);
+  if (session.pending.some((pending) => pending.responseState === "unconfirmed" || pending.expiresAt !== undefined && pending.expiresAt <= now)) {
+    return status("Approval resolution unconfirmed", "Warning", "?", true);
+  }
   if (hasPendingReply(session, now)) return status("Needs reply", "Warning", "▲");
   if (session.status === "awaiting") return status("Waiting status unverified", "Warning", "?", true);
   if (session.status === "error") return status("Session error", "Attention", "!", true);
@@ -150,7 +154,8 @@ function statusBlock(status: SessionAppearance, prefix = ""): Record<string, unk
 }
 
 function hasPendingReply(session: SessionRecord, now: number): boolean {
-  return session.pending.length > 0 && session.status !== "offline" && freshEndpoint(session, now) &&
+  return session.pending.some((pending) => !pending.responseState && (pending.expiresAt === undefined || pending.expiresAt > now)) &&
+    session.status !== "offline" && freshEndpoint(session, now) &&
     (session.kind === "owned" || session.kind === "peer" || session.kind === "controller");
 }
 
@@ -491,7 +496,9 @@ export class Cards {
         }
         if (target.pending.length) {
           for (const pending of target.pending.slice(0, 3)) {
-            this.request(body, conversation, target, pending);
+            if (state.interaction?.remoteApprovals === false && (pending.kind === "permission" || pending.kind === "plan")) {
+              body.push(block("Remote approvals are disabled. No approval action is available.", { color: "Warning" }));
+            } else this.request(body, conversation, target, pending);
           }
           if (target.pending.length > 3) body.push(block("Additional pending requests appear after these are resolved."));
         }
@@ -673,32 +680,47 @@ export class Cards {
   }
 
   private request(body: Record<string, unknown>[], conversation: ConversationRecord, target: SessionRecord, pending: PendingRequest): void {
-    const label = pending.kind === "input" ? "Question" : pending.kind === "permission" ? "Approval" : "Plan";
+    const label = pending.kind === "input" ? "Question" : pending.kind === "permission" ? "Approval" : pending.kind === "form" ? "Structured form" : "Plan";
     body.push(block(`${label}: ${safeText(pending.title, 800)}`, { size: "Small", color: "Attention" }));
     if (target.kind === "peer" || target.kind === "unavailable") {
       body.push(block("Answer in the owning host. Peer messages are not human approvals.", { size: "Small" }));
       return;
     }
+    if (pending.kind === "form") {
+      body.push(block("Structured form responses are unavailable here. No response was sent; use the original native UI.", { size: "Small", color: "Warning" }));
+      return;
+    }
+    if (pending.responseState || pending.expiresAt !== undefined && pending.expiresAt <= Date.now()) {
+      body.push(block(pending.responseState === "submitted" ? "Response submitted. Awaiting native confirmation; do not repeat it."
+        : "Approval expired or its resolution is unconfirmed. No remote Allow is available.", { size: "Small", color: "Warning" }));
+      return;
+    }
     const suffix = inputSuffix(pending.id);
     const scope = { op: "answer", targetId: target.id, requestId: pending.id } as const;
     const form: Record<string, unknown>[] = [block(safeText(pending.title, 2400))];
+    if (pending.details) form.push(block(pending.details.replace(/[\\`*_{}\[\]()#+.!|<>~&=-]/gu, "\\$&"),
+      { fontType: "Monospace", size: "Small" }, Number.MAX_SAFE_INTEGER));
+    if (pending.detailsComplete === false) form.push(block("Complete approval details cannot be displayed. Allow is unavailable; use Deny / Request changes or the original host.", { color: "Warning" }));
     if (pending.choices.length) form.push({
       type: "Input.ChoiceSet", id: `choice_${suffix}`, label: pending.kind === "plan" ? "Native continuation action" : "Choice",
       choices: pending.choices.map((choice, index) => ({ title: safeText(choice, 100), value: String(index) })),
     });
     if (pending.allowFreeform) form.push({
-      type: "Input.Text", id: `text_${suffix}`, label: pending.kind === "plan" ? "Feedback (optional)" : "Freeform answer", isMultiline: true, maxLength: 4000,
+      type: "Input.Text", id: `text_${suffix}`, label: pending.kind === "plan" || pending.kind === "permission" ? "Feedback (optional)" : "Freeform answer", isMultiline: true, maxLength: 4000,
     });
-    const submit = this.execute(conversation, pending.kind === "permission" ? "Approve once" : pending.kind === "plan" ? "Approve plan" : "Answer", {
+    const submit = this.execute(conversation, pending.kind === "permission"
+      ? conversation.actionVersion === 2 ? "Allow once" : "Approve once" : pending.kind === "plan" ? "Approve plan" : "Answer", {
       ...scope, argument: "accept",
     }, true);
+    const session = pending.kind === "permission" && pending.canApproveSession && pending.detailsComplete !== false
+      ? this.execute(conversation, "Allow for this session", { ...scope, argument: "session" }, true) : undefined;
     const decline = this.execute(conversation, pending.kind === "input" ? "Skip question" : pending.kind === "permission" ? "Deny" : "Request changes", {
       ...scope, argument: "decline",
     }, true);
     body.push({
       type: "ActionSet", actions: [{
         type: "Action.ShowCard", title: pending.kind === "input" ? "Answer question" : `Review ${label.toLowerCase()}`,
-        card: card(form, [submit, decline]),
+        card: card(form, [...(pending.detailsComplete === false ? [] : [submit]), ...(session ? [session] : []), decline]),
       }],
     });
   }

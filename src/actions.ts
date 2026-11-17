@@ -3,7 +3,8 @@ import { isSessionListView, type ConversationRecord, type View } from "./domain.
 import { canonicalId, object, string, UserError } from "./safety.js";
 
 export const operations = ["view", "page", "filter", "select", "create", "send", "refresh", "stop", "pick-model", "settings", "answer", "subscribe", "unsubscribe",
-  "show-full", "history-source", "inbox", "follow", "mute", "open-source", "route-send", "route-create", "route-refresh", "digest-page"] as const;
+  "show-full", "history-source", "inbox", "follow", "mute", "open-source", "route-send", "route-create", "route-refresh", "digest-page",
+  "confirm-stop", "cancel-stop", "steer"] as const;
 export type Operation = typeof operations[number];
 
 export interface ActionScope {

@@ -16,7 +16,7 @@ import type {
   AppSessionsOptions, AppSessionClient, AppSessionCompletion, AppSessionInfo, AppSessionSnapshot, AppSessionTurn,
 } from "../src/app-sessions.js";
 import { LocalAppSessions } from "../src/app-sessions.js";
-import { digest, object } from "../src/safety.js";
+import { digest, object, UncertainOperationError } from "../src/safety.js";
 import { Projector } from "../src/projection.js";
 import { completeAppSend, eventually, findAction, temporary, legacySend } from "./helpers.js";
 
@@ -1714,6 +1714,164 @@ function saved(id: string, workspace: string): SessionRecord {
     timeline: [], pending: [], seenEvents: [], sequence: 0, updatedAt: 0,
   };
 }
+
+test("v3 native session grants use the latest explicit command scope and managed requests remain one-shot", async (t) => {
+  const h = await setup(t);
+  try {
+    const id = randomUUID();
+    await h.runtime.create(createOptions(id, h.directory));
+    const state = h.client.sessions.get(id)!;
+    let prompt = {
+      kind: "commands" as const, fullCommandText: "npm test", intention: "Run tests",
+      commandIdentifiers: ["npm"], canOfferSessionApproval: true, managedApprovalRequired: false,
+    };
+    t.mock.method(state.port.rpc.permissions, "pendingRequests", async () => ({
+      items: state.pendingPermission ? [{ requestId: state.pendingPermission, request: prompt }] : [],
+    }));
+    const first = randomUUID();
+    state.pendingPermission = first;
+    await h.runtime.answer(id, first, { approve: true, permission: "session" });
+    assert.deepEqual(state.permissionResults[0], {
+      requestId: first, result: { kind: "approve-for-session", approval: { kind: "commands", commandIdentifiers: ["npm"] } },
+    });
+    state.pendingPermission = randomUUID();
+    prompt = { ...prompt, managedApprovalRequired: true };
+    await assert.rejects(() => h.runtime.answer(id, state.pendingPermission!, { approve: true, permission: "session" }), /no session-wide/);
+    assert.equal(state.permissionResults.length, 1);
+    await h.runtime.answer(id, state.pendingPermission!, { approve: true, permission: "once" });
+    assert.ok(object(state.permissionResults[1]) && object(state.permissionResults[1].result));
+    assert.equal(state.permissionResults[1].result.kind, "approve-once");
+    assert.equal(state.permissionResults[1].result.approvedInteractively, true);
+    assert.equal(state.config.onPermissionRequest, undefined, "default remains manual event/RPC handling, not auto-approval");
+  } finally { await h.runtime.close(); }
+});
+
+test("v3 native approval timeout returns user-not-available once and resolved-elsewhere events cancel stale timeout work", async (t) => {
+  const h = await setup(t);
+  h.options.approvalTimeoutMs = 25;
+  try {
+    const id = randomUUID();
+    await h.runtime.create(createOptions(id, h.directory));
+    const state = h.client.sessions.get(id)!;
+    const requestId = randomUUID();
+    state.pendingPermission = requestId;
+    const requested = (requestId: string): SessionEvent => ({
+      type: "permission.requested", id: randomUUID(), timestamp: new Date().toISOString(), parentId: null,
+      data: { requestId, permissionRequest: { kind: "read", path: "fixture.txt", intention: "Read a fixture" } },
+    });
+    state.config.onEvent?.(requested(requestId));
+    await eventually(() => state.permissionResults.length === 1);
+    assert.deepEqual(state.permissionResults[0], { requestId, result: { kind: "user-not-available" } });
+    await assert.rejects(() => h.runtime.answer(id, requestId, { approve: true }), /stale/);
+    const next = randomUUID();
+    state.pendingPermission = next;
+    state.config.onEvent?.(requested(next));
+    state.pendingPermission = undefined;
+    state.config.onEvent?.({ type: "permission.completed", id: randomUUID(), timestamp: new Date().toISOString(), parentId: null,
+      data: { requestId: next, result: { kind: "approved" } } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(state.permissionResults.length, 1);
+  } finally { await h.runtime.close(); }
+});
+
+test("v3 native off policy denies permission and plan approval without exposing allow-all or a remote form provider", async (t) => {
+  const h = await setup(t);
+  h.options.remoteApprovals = false;
+  try {
+    const id = randomUUID();
+    await h.runtime.create(createOptions(id, h.directory));
+    const state = h.client.sessions.get(id)!;
+    assert.equal(state.config.permissionMode, "manual");
+    assert.equal(state.required, true);
+    assert.ok(state.config.onPermissionRequest && state.config.onExitPlanModeRequest);
+    assert.deepEqual(await state.config.onPermissionRequest({ kind: "read", path: "fixture", intention: "Read" }, { sessionId: id }),
+      { kind: "user-not-available" });
+    assert.deepEqual(await state.config.onExitPlanModeRequest({
+      requestId: randomUUID(), summary: "Plan", actions: ["interactive"], recommendedAction: "interactive",
+    }, { sessionId: id }), { approved: false, feedback: "Remote approvals are disabled." });
+    state.pendingPermission = randomUUID();
+    await assert.rejects(() => h.runtime.answer(id, state.pendingPermission!, { approve: true }), /disabled/);
+    assert.equal(state.permissionResults.length, 0);
+    assert.equal(state.config.onElicitationRequest, undefined, "do not claim a form capability or steal another client's first response");
+  } finally { await h.runtime.close(); }
+});
+
+test("v3 native steering uses immediate only for the observed root and ambiguous send/stop acknowledgements never look definite", async (t) => {
+  const h = await setup(t);
+  try {
+    const id = randomUUID();
+    await h.runtime.create(createOptions(id, h.directory));
+    const state = h.client.sessions.get(id)!;
+    const root = "observed-root-message";
+    state.config.onEvent?.({ type: "user.message", id: randomUUID(), timestamp: new Date().toISOString(), parentId: null,
+      data: { messageId: root, content: "Original request" } });
+    state.config.onEvent?.({ type: "assistant.turn_start", id: randomUUID(), timestamp: new Date().toISOString(), parentId: null,
+      data: { turnId: "turn-1" } });
+    const send = t.mock.method(state.port, "send", state.port.send.bind(state.port));
+    await h.runtime.send(id, " exact steering\r\n ", undefined, { mode: "immediate", expectedMessageId: root });
+    assert.deepEqual(send.mock.calls[0]!.arguments[0], { prompt: " exact steering\r\n ", mode: "immediate" });
+    state.config.onEvent?.({ type: "session.idle", id: randomUUID(), timestamp: new Date().toISOString(), parentId: null,
+      ephemeral: true, data: {} });
+    await assert.rejects(() => h.runtime.send(id, "stale steering", undefined, { mode: "immediate", expectedMessageId: root }), /confirmed/);
+    assert.equal(send.mock.callCount(), 1);
+    send.mock.restore();
+    t.mock.method(state.port, "send", async () => { throw new Error("Synthetic lost ACK"); });
+    await assert.rejects(() => h.runtime.send(id, "uncertain ordinary send"), UncertainOperationError);
+    t.mock.method(state.port, "abort", async () => { throw new Error("Synthetic abort ACK loss"); });
+    await assert.rejects(() => h.runtime.stop(id), UncertainOperationError);
+  } finally { await h.runtime.close(); }
+});
+
+test("v3 native questions/plans keep exact IDs/actions while unsupported form and foreign-owner requests cannot be answered", async (t) => {
+  const h = await setup(t);
+  try {
+    const id = randomUUID();
+    await h.runtime.create(createOptions(id, h.directory));
+    const state = h.client.sessions.get(id)!;
+    assert.ok(state.config.onExitPlanModeRequest);
+    const planId = randomUUID();
+    const reply = state.config.onExitPlanModeRequest({
+      requestId: planId, summary: "A short plan", planContent: "Inspect, then change the fixture.",
+      actions: ["interactive", "exit_only"], recommendedAction: "interactive",
+    }, { sessionId: id });
+    await h.runtime.answer(id, planId, { approve: true, choice: 1, text: "Exit without executing." });
+    assert.deepEqual(await reply, { approved: true, selectedAction: "exit_only", feedback: "Exit without executing." });
+    const formId = randomUUID();
+    state.config.onEvent?.({ type: "elicitation.requested", id: randomUUID(), timestamp: new Date().toISOString(), parentId: null, ephemeral: true,
+      data: { requestId: formId, message: "Form", mode: "form", requestedSchema: { type: "object", properties: { answer: { type: "string" } } } } });
+    await assert.rejects(() => h.runtime.answer(id, formId, { text: "must not be guessed" }), /original native UI/);
+    await assert.rejects(() => h.runtime.send(id, "not an answer"), /structured form/);
+    state.config.onEvent?.({ type: "elicitation.completed", id: randomUUID(), timestamp: new Date().toISOString(), parentId: null,
+      ephemeral: true, data: { requestId: formId, action: "cancel" } });
+    const foreign = randomUUID();
+    state.pendingPermission = foreign;
+    state.config.onEvent?.({ type: "permission.requested", id: randomUUID(), timestamp: new Date().toISOString(), parentId: null,
+      data: { requestId: foreign, ownerSessionId: randomUUID(), permissionRequest: { kind: "read", path: "fixture", intention: "Foreign owner" } } });
+    await assert.rejects(() => h.runtime.answer(id, foreign, { approve: true }), /disabled/);
+    assert.equal(state.permissionResults.length, 0);
+  } finally { await h.runtime.close(); }
+});
+
+test("v3 native plan timeout declines the exact pending callback instead of approving or choosing a continuation", async (t) => {
+  const h = await setup(t);
+  h.options.approvalTimeoutMs = 20;
+  try {
+    const id = randomUUID();
+    await h.runtime.create(createOptions(id, h.directory));
+    const config = h.client.sessions.get(id)!.config;
+    assert.ok(config.onExitPlanModeRequest);
+    const requestId = randomUUID();
+    const pending = config.onExitPlanModeRequest({
+      requestId, summary: "Timed plan", planContent: "Do not execute without approval.",
+      actions: ["interactive", "autopilot"], recommendedAction: "interactive",
+    }, { sessionId: id });
+    const keepAlive = new Promise((resolve) => setTimeout(resolve, 40));
+    assert.deepEqual(await pending, { approved: false, feedback: "Approval timed out: user not available." });
+    await keepAlive;
+    await assert.rejects(() => h.runtime.answer(id, requestId, { approve: true, choice: 1 }), /stale/);
+    assert.equal(h.client.sent.length, 0);
+  } finally { await h.runtime.close(); }
+});
 
 test("native client is persistent, explicitly isolated and never inherits Teams/Twin/token variables", async (t) => {
   const h = await setup(t);
