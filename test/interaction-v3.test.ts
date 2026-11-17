@@ -793,6 +793,33 @@ test("v3 Stop requires a distinct owner confirmation, preserves the current focu
   assert.deepEqual(h.runtime.stopped, [a]);
 });
 
+for (const decision of ["Confirm Stop", "Cancel"] as const) test(`v3 Stop notice stays accurate in the delivered header after ${decision}`, async (t) => {
+  const h = await harness(t, true, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.text("ask");
+  await eventually(() => Boolean(h.bridge.store.snapshot().sessions[id]?.pending.length));
+  await h.text("!stop");
+  await h.bridge.flush();
+  const before = h.bridge.store.snapshot();
+  const header = surface(before, "header", id);
+  const stop = surface(before, "stop", id);
+  assert.ok(header.activityId && stop.activityId);
+  await h.action(findAction(h.transport.messages.get(stop.activityId), decision));
+  await h.bridge.flush();
+  const after = h.bridge.store.snapshot();
+  const confirmed = decision === "Confirm Stop";
+  assert.equal(after.interaction!.surfaces[stop.id]!.stop!.state, confirmed ? "accepted" : "cancelled");
+  assert.equal(after.interaction!.turns[stop.turnId!]!.state, confirmed ? "stopped" : "waiting");
+  assert.equal(after.sessions[id]!.pending.length, confirmed ? 0 : 1);
+  assert.deepEqual(h.runtime.stopped, confirmed ? [id] : []);
+  assert.equal(surface(after, "header", id).activityId, header.activityId);
+  const delivered = h.transport.messages.get(header.activityId);
+  assert.ok(delivered?.message.type === "card");
+  const text = delivered.message.card.body.flatMap((entry) => typeof entry.text === "string" ? [entry.text] : []).join("\n");
+  assert.match(text, /See the separate Stop card for this request's status/);
+  assert.doesNotMatch(text, /Confirm Stop on its separate card|No stop has been sent yet/);
+});
+
 test("v3 an old Stop confirmation cannot abort a different observed request and App sources never expose remote Stop", async (t) => {
   const h = await harness(t, false, undefined, { interaction: options });
   const id = await createWorking(h);

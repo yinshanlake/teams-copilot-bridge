@@ -1434,7 +1434,7 @@ export class Bridge {
         state: "pending", expiresAt: Date.now() + (this.options.actionTtlMs ?? 15 * 60_000),
         ...(active?.messageId ? { messageId: active.messageId } : {}),
       };
-      state.conversations[key]!.notice = "Confirm Stop on its separate card. No stop has been sent yet.";
+      state.conversations[key]!.notice = "See the separate Stop card for this request's status.";
     });
     this.schedule(key);
   }
