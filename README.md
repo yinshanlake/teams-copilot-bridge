@@ -259,19 +259,46 @@ reference supplies context without pretending to be a native server-stamped
 quote. Three or more passive source notifications within 60 seconds can form
 one digest; direct task replies are never folded into it. Individual passive
 notifications may wait for that collection window.
+Digests group by canonical source, not display title or result count. Larger
+collections use bounded pages/batches; the final signed activity is checked
+before any member is claimed. Remainders stay queued rather than being lost.
 
 `BRIDGE_STATUS_UPDATE_SECONDS` defaults to 5 (minimum 2); state transitions can
 update immediately. `BRIDGE_FOLLOW_HOURS` defaults to 24 (minimum 1). Values must
 fit the validated timer range. Rendering cards and following do not start an SDK.
 
-The Store now writes **schema 2**. Opening schema 1 validates the same owner and
+The Store now writes **schema 3**. Opening schema 1 or 2 validates the same owner and
 atomically preserves its sources, receipts, admissions, subscription cursors and
-all legacy outbox bytes/statuses. Old binaries reject schema 2. A controlled
+all legacy outbox bytes/statuses. Earlier readers reject schema 3 rather than
+ignore the new routing/alias semantics. A controlled
 upgrade must stop the single writer and retain a consistent private backup.
 After any newly accepted work, restoring an older database is **not a safe
 rollback**: it can lose deduplication and receipt facts. Retain the schema-aware
 binary/state and review a forward fix or an explicit offline downgrade instead.
 See the [design and implementation record](docs/design/interaction-v3.md).
+
+`BRIDGE_THREADS` and `BRIDGE_REACTIONS` accept `auto` (default) or `off`.
+**Both transports currently remain in Focus mode**: preview thread posting,
+native quotes and reactions are not enabled merely because a different SDK
+documents them. This is a working fallback, not a startup error. The endpoint
+and relay wire capabilities are not expanded.
+
+An authenticated reply with thread metadata but no supported binding is retained
+as an **unsent draft**, not sent to the old Focus target. Its Routing card offers
+a writable source or explicit creation in an allowed workspace. Only Send once /
+Create and send once forwards the original unchanged text. Drafts expire after
+the action TTL (normally 15 minutes), with at most 16 pending drafts; an uncertain
+attempt has no retry action. Refresh choices can replace an unattempted stale UI,
+not replay accepted work. The Inbox exposes pending drafts.
+
+Containing-chat IDs establish checked aliases for opaque conversation IDs;
+existing conversation-keyed receipts/cursors are not rewritten. Conflicting
+identities fail closed rather than merge sources. No opaque ID is parsed to
+invent a root. Unprefixed text remains work, and `!` commands work in both places.
+The optional remembered-target UI and persistent session-thread bindings are
+withheld until actual thread support is verified; Focus keeps its explicit
+visible selection instead. Current headers update independently of Inbox
+navigation, and older Focus headers are frozen without cancelling their tasks.
 
 ## Private state and operational limits
 

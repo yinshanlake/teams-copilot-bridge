@@ -126,6 +126,7 @@ export interface ConversationRecord {
   read: Record<string, number>;
   surfaceId?: string;
   actionVersion?: 2;
+  chatId?: string;
   sideParentId?: string;
   historyRead?: {
     id: string;
@@ -229,6 +230,8 @@ export interface InteractionOptions {
   statusUpdateMs: number;
   followMs: number;
   digestMs?: number;
+  threads?: "auto" | "off";
+  reactions?: "auto" | "off";
 }
 
 export interface FollowPreference {
@@ -242,7 +245,25 @@ export interface FollowPreference {
   detail: string;
 }
 
-export type InteractionSurfaceKind = "inbox" | "turn" | "request" | "result" | "digest";
+export type InteractionSurfaceKind = "inbox" | "header" | "turn" | "request" | "result" | "digest" | "routing";
+
+export interface RoutingIntent {
+  id: string;
+  conversationKey: string;
+  surfaceId: string;
+  receiptId: string;
+  reference: ConversationReference;
+  prompt: string;
+  expiresAt: number;
+  state: "pending" | "sending" | "sent" | "uncertain" | "rejected" | "expired";
+  sessionId?: string;
+}
+
+export interface IncomingAddress {
+  chatId?: string;
+  rootId?: string;
+  place: "top" | "thread" | "unknown";
+}
 
 export interface InteractionSurface {
   id: string;
@@ -252,6 +273,7 @@ export interface InteractionSurface {
   turnId?: string;
   requestId?: string;
   outboxId?: string;
+  routingId?: string;
   revision: number;
   version: number;
   renderedVersion?: number;
@@ -261,6 +283,7 @@ export interface InteractionSurface {
   urgent: boolean;
   frozen?: string;
   retryAt?: number;
+  page?: number;
 }
 
 export interface InteractionTurn {
@@ -285,6 +308,9 @@ export interface InteractionState {
   turns: Record<string, InteractionTurn>;
   follows: Record<string, FollowPreference>;
   active: Record<string, string>;
+  aliases?: Record<string, string>;
+  routes?: Record<string, RoutingIntent>;
+  capabilityNotice?: string;
 }
 
 export interface JournalCursor {
@@ -313,7 +339,7 @@ export interface DirectOrigin {
 }
 
 export interface BridgeState {
-  schema: 1 | 2;
+  schema: 1 | 2 | 3;
   owner: string;
   actionKey: string;
   controllerId?: string;
@@ -378,6 +404,7 @@ export type Outbound = { type: "card"; card: Card; summary?: string } | { type: 
 
 export interface Transport {
   readonly connected?: boolean;
+  readonly capabilities?: { threadReplies: false; quotedReplies: false; reactions: false };
   send(reference: ConversationReference, message: Outbound): Promise<string>;
   update(reference: ConversationReference, id: string, card: Card): Promise<void>;
 }

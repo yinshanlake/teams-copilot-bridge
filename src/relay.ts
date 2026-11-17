@@ -143,6 +143,7 @@ function normalizedRelayActivity(activity: Record<string, unknown>): Record<stri
 }
 
 export class RelayConnection implements Transport {
+  readonly capabilities = { threadReplies: false, quotedReplies: false, reactions: false } as const;
   private readonly socket: RelaySocket;
   private readonly pending = new Map<string, PendingSend>();
   private handler: ActivityHandler | undefined;

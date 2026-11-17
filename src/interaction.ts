@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { ConversationReference } from "@microsoft/agents-activity";
 import type {
   BridgeState, Card, ConversationRecord, FollowPreference, InteractionOptions, InteractionState,
   InteractionSurface, InteractionSurfaceKind, InteractionTurn, RuntimeEvent,
@@ -47,7 +48,7 @@ export function followDescription(state: BridgeState, key: string, sessionId: st
 
 export function newSurface(
   state: BridgeState, conversationKey: string, kind: InteractionSurfaceKind,
-  scope: Pick<InteractionSurface, "sessionId" | "turnId" | "requestId" | "outboxId"> = {},
+  scope: Pick<InteractionSurface, "sessionId" | "turnId" | "requestId" | "outboxId" | "routingId"> = {},
 ): InteractionSurface {
   const surface: InteractionSurface = {
     id: randomUUID(), conversationKey, kind, ...scope,
@@ -73,6 +74,19 @@ export function inbox(state: BridgeState, key: string, replace = false): Interac
     touchSurface(current, true);
   }
   return newSurface(state, key, "inbox");
+}
+
+export function focusHeader(state: BridgeState, key: string, sessionId: string): InteractionSurface {
+  const ui = interactionState(state);
+  const current = Object.values(ui.surfaces).find((surface) =>
+    surface.conversationKey === key && surface.kind === "header" && !surface.frozen);
+  if (current?.sessionId === sessionId) return current;
+  if (current) {
+    current.frozen = "Focus changed. Use the current session header or Inbox. Existing task replies still keep their original destination.";
+    current.revision++;
+    touchSurface(current, true);
+  }
+  return newSurface(state, key, "header", { sessionId });
 }
 
 export function surfaceConversation(state: BridgeState, surface: InteractionSurface): ConversationRecord {
@@ -101,13 +115,14 @@ export function setTurnState(state: BridgeState, turn: InteractionTurn, next: In
   }
 }
 
-export function startTurn(state: BridgeState, key: string, sessionId: string, receiptId: string): InteractionTurn {
+export function startTurn(state: BridgeState, key: string, sessionId: string, receiptId: string, origin?: ConversationReference): InteractionTurn {
   const conversation = state.conversations[key];
-  if (!conversation?.reference.activityId) throw new UserError("The authenticated prompt activity ID is missing; nothing was sent.");
+  const reference = origin ?? conversation?.reference;
+  if (!reference?.activityId) throw new UserError("The authenticated prompt activity ID is missing; nothing was sent.");
   const surface = newSurface(state, key, "turn", { sessionId, turnId: receiptId });
   const turn: InteractionTurn = {
     id: receiptId, conversationKey: key, sessionId, surfaceId: surface.id,
-    teamsActivityId: conversation.reference.activityId, reference: structuredClone(conversation.reference),
+    teamsActivityId: reference.activityId, reference: structuredClone(reference),
     state: "admitting", at: Date.now(), steps: [],
   };
   interactionState(state).turns[receiptId] = turn;
@@ -120,7 +135,8 @@ export function turnForOrigin(state: BridgeState, sessionId: string, origin: unk
 }
 
 export function observeInteraction(state: BridgeState, incoming: RuntimeEvent): void {
-  if (incoming.historical || !state.interaction || !object(incoming.event)) return;
+  if (incoming.historical || !state.interaction || !object(incoming.event) ||
+    !string(incoming.event.type) || !string(incoming.event.id)) return;
   const event = incoming.event;
   const data = event.data;
   if (!object(data)) return;
@@ -200,6 +216,13 @@ export function observeInteraction(state: BridgeState, incoming: RuntimeEvent): 
           sessionId: session.id, requestId: pending.id, ...(turn ? { turnId: turn.id } : {}),
         });
       }
+      for (const header of Object.values(ui.surfaces)) {
+        if (header.kind === "header" && header.sessionId === session.id && !header.frozen) {
+          touchSurface(header, ["user.message", "user_input.requested", "user_input.completed", "permission.requested", "permission.completed",
+            "exit_plan_mode.requested", "exit_plan_mode.completed", "session.idle", "session.error", "session.task_complete",
+            "session.shutdown", "abort", "bridge.app_admission_consumed", "bridge.app_admission_confirmed", "bridge.app_output_unavailable"].includes(String(event.type)));
+        }
+      }
     }
   }
   for (const surface of Object.values(ui.surfaces)) {
@@ -234,11 +257,20 @@ export function renderInteractionSurface(
     const body = [
       block("Copilot Sessions - Inbox", { size: "Medium", weight: "Bolder" }),
       block("Send work in the Teams composer. Use buttons or !commands for control.", { size: "Small" }),
+      block(state.interaction?.capabilityNotice ?? "Focus mode. Preview operations are unavailable.", { size: "Small" }),
       block(conversation.selectionBlocked ? "Destination unresolved. Nothing new will be sent until you select a valid source."
         : selected ? `Next message -> ${selected.name} (${selected.id.slice(0, 8)})` : "No target selected. Choose a session before sending."),
       block(`Needs you: ${waiting.length} | Running: ${running.length} | Recently done: ${completed.length}`),
       block("App pending questions/approvals are unknown. Check the original host.", { size: "Small", isSubtle: true }),
     ];
+    const routes = Object.values(state.interaction?.routes ?? {}).filter((route) =>
+      route.conversationKey === conversation.key && route.state === "pending" && route.expiresAt > now);
+    if (routes.length) body.push({
+      type: "Container", items: [
+        block(`${routes.length} unsent draft(s) need a target`, { weight: "Bolder" }),
+        { type: "ActionSet", actions: [action("Review draft", { op: "route-refresh", argument: routes[0]!.id })] },
+      ],
+    });
     for (const source of visible) body.push({
       type: "Container", separator: true, items: [
         block(sourceTitle(source, state.sessions), { weight: "Bolder" }),
@@ -256,10 +288,53 @@ export function renderInteractionSurface(
       action("Refresh", { op: "inbox", argument: "refresh" }),
     ]);
   }
+  if (surface.kind === "routing") {
+    const route = state.interaction?.routes?.[surface.routingId ?? ""];
+    if (!route) throw new UserError("This routing request is no longer available.");
+    if (route.state !== "pending" || route.expiresAt <= now) return card([
+      block(route.state === "sent" ? `Sent once to ${state.sessions[route.sessionId ?? ""]?.name ?? route.sessionId}`
+        : route.state === "uncertain" || route.state === "sending" ? "May have been accepted - check the original host. Do not resend."
+          : route.state === "rejected" ? "This draft was not sent. Select a valid source before sending new work."
+            : "Routing request expired. Nothing was sent.", { weight: "Bolder" }),
+    ], [action("Inbox", { op: "inbox" })]);
+    const writable = Object.values(state.sessions).filter((source) =>
+      (source.kind === "owned" || source.kind === "peer") && source.access?.send !== false && !source.pending.length &&
+      (source.peerSource !== "app" || (source.liveUntil ?? 0) > now))
+      .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)).slice(0, 20);
+    return card([
+      block("Choose where to send this unchanged draft", { weight: "Bolder" }),
+      block("This reply is not bound to a supported session thread. Focus fallback has not forwarded it.", { size: "Small" }),
+      block(safeText(route.prompt, 120), {}, 160),
+      { type: "Input.ChoiceSet", id: "source", label: "Recent writable sources", choices: writable.map((source) => ({
+        title: safeText(source.name, 100), value: source.id,
+      })) },
+      { type: "Input.Text", id: "target", label: "Or an exact source name / canonical ID", maxLength: 220 },
+      block("Read-only sources are not send choices. All sessions shows their reasons. Model uses the configured default for new sessions.", { size: "Small" }),
+    ], [
+      cards.scopedAction(context, "Send once", { op: "route-send", argument: route.id }, true),
+      { type: "Action.ShowCard", title: "Create and send", card: card(cards.newSessionInputs(), [
+        cards.scopedAction(context, "Create and send once", { op: "route-create", argument: route.id }, true),
+      ]) },
+      action("Refresh choices", { op: "route-refresh", argument: route.id }),
+      action("All sessions", { op: "view", argument: "sessions" }),
+    ]);
+  }
   if (surface.kind === "request") {
     const pending = session?.pending.find((request) => request.id === surface.requestId);
     return session && pending ? cards.requestSurface(context, session, pending)
       : card([block(title, { weight: "Bolder" }), block("Already resolved. No response was sent.")]);
+  }
+  if (surface.kind === "header") {
+    const header = cards.render({ ...state, conversations: { ...state.conversations, [context.key]: context } }, context.key);
+    header.body.splice(1, 0, block(`Next message -> ${title}`, { weight: "Bolder" }),
+      block(followDescription(state, context.key, surface.sessionId!), { size: "Small" }));
+    header.actions = [...(header.actions ?? []), action("Change next target", { op: "view", argument: "sessions" })];
+    if (Buffer.byteLength(JSON.stringify(header)) > 27_000) return card([
+      block(`Next message -> ${title}`, { weight: "Bolder" }),
+      block("Details exceed Teams' card budget. Pending requests have separately scoped cards; use History for source content."),
+    ], [action("History", { op: "history-source", targetId: surface.sessionId! }),
+      action("Change next target", { op: "view", argument: "sessions" }), action("Inbox", { op: "inbox" })]);
+    return header;
   }
   if (surface.kind === "turn") {
     const turn = state.interaction?.turns[surface.turnId ?? ""];
@@ -301,18 +376,29 @@ export function renderInteractionSurface(
   if (!item) throw new UserError("This result is no longer available.");
   if (surface.kind === "digest") {
     const members = item.digest?.memberIds.flatMap((id) => state.outbox.find((entry) => entry.id === id) ?? []) ?? [];
-    const body = [block(`${members.length} followed sessions have new replies`, { weight: "Bolder" }),
-      block("Background notifications only. Explicit task replies keep their original destination.", { size: "Small" })];
-    const choices: Record<string, unknown>[] = [];
+    const groups = new Map<string, typeof members>();
     for (const member of members) {
-      const source = state.sessions[member.sessionId];
-      body.push(block(`${source?.name ?? member.sessionId}: ${safeText(member.text, 120)}`, { size: "Small" }));
-      choices.push(action(`Open ${safeText(source?.name ?? member.sessionId, 45)}`, { op: "open-source", targetId: member.sessionId }));
+      const group = groups.get(member.sessionId) ?? [];
+      group.push(member);
+      groups.set(member.sessionId, group);
     }
-    return card(body, choices.length <= 4 ? [...choices, action("Inbox", { op: "inbox" })] : [
-      ...choices.slice(0, 3), { type: "Action.ShowCard", title: "More sessions", card: card([], choices.slice(3)) },
-      action("Inbox", { op: "inbox" }),
-    ]);
+    const pages = Math.max(1, Math.ceil(groups.size / 3));
+    const page = Math.min(surface.page ?? 0, pages - 1);
+    const body = [block(`${groups.size} followed sessions have ${members.length} new replies`, { weight: "Bolder" }),
+      block(`Background notifications only. Page ${page + 1} of ${pages}. Explicit task replies keep their original destination.`, { size: "Small" })];
+    const choices: Record<string, unknown>[] = [];
+    for (const [, group] of [...groups].slice(page * 3, page * 3 + 3)) {
+      const member = group.at(-1)!;
+      const source = state.sessions[member.sessionId];
+      body.push(block(`${source?.name ?? member.sessionId} (${member.sessionId.slice(0, 8)}): ${group.length} new replies. ${safeText(member.text, 120)}`, { size: "Small" }));
+      choices.push(action(`Open ${safeText(source?.name ?? member.sessionId, 35)} ${member.sessionId.slice(0, 8)}`, {
+        op: "open-source", targetId: member.sessionId,
+      }));
+    }
+    if (page > 0) choices.push(action("Previous sources", { op: "digest-page", argument: String(page - 1) }));
+    if (page + 1 < pages) choices.push(action("More sources", { op: "digest-page", argument: String(page + 1) }));
+    if (choices.length < 5) choices.push(action("Inbox", { op: "inbox" }));
+    return card(body, choices);
   }
   const turn = state.interaction?.turns[surface.turnId ?? ""];
   return card([

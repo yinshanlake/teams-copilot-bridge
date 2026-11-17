@@ -37,7 +37,7 @@ export interface Harness {
 
 export async function harness(
   t: TestContext, autonomous = false, directory?: string,
-  options: { initializeConversation?: boolean; inventoryOnStart?: boolean; appLivenessTimeoutMs?: number; historyReadTimeoutMs?: number; deliveryInitiallyPaused?: boolean; interaction?: InteractionOptions } = {},
+  options: { initializeConversation?: boolean; inventoryOnStart?: boolean; appLivenessTimeoutMs?: number; historyReadTimeoutMs?: number; deliveryInitiallyPaused?: boolean; interaction?: InteractionOptions; cardActions?: "submit" | "execute" } = {},
 ): Promise<Harness> {
   const path = directory ?? await temporary(t);
   const store = await Store.open(path, "test-owner");
@@ -45,7 +45,7 @@ export async function harness(
   const transport = new PreviewTransport();
   const bridge = new Bridge(store, runtime, transport, {
     owner: "test-owner", workspaces: [{ id: "local", name: "Test workspace", path }],
-    coalesceMs: 20, cardActions: "execute",
+    coalesceMs: 20, cardActions: options.cardActions ?? "execute",
     ...(options.inventoryOnStart === undefined ? {} : { inventoryOnStart: options.inventoryOnStart }),
     ...(options.appLivenessTimeoutMs === undefined ? {} : { appLivenessTimeoutMs: options.appLivenessTimeoutMs }),
     ...(options.historyReadTimeoutMs === undefined ? {} : { historyReadTimeoutMs: options.historyReadTimeoutMs }),

@@ -76,6 +76,14 @@ This adapter supports message/`Action.Submit` activities, not synchronous
 client receives it; the bridge's management commands are explicit `!` commands.
 No automatic welcome-on-install/chat-open behavior is promised.
 
+Interaction v3 runs in Focus mode over this relay. Send/update remain the only
+declared operations; thread posting, native quotes, reactions and deletes are
+not inferred from a generic activity payload. Preview `auto` settings therefore
+degrade without preventing startup. Thread-addressed work is retained for an
+explicit Routing-card choice; it is not silently forwarded to an old selection.
+The independent Inbox, current header, task/request cards and result previews use
+ordinary authenticated send/update messages, not a new relay protocol.
+
 An authenticated relay is trusted to represent the Bot service's inbound
 activity. It is an additional trust boundary, not a reason to skip the bridge's
 owner/tenant/personal-scope checks. Uncertain send outcomes are not automatically

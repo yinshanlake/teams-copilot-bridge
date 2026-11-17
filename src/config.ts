@@ -80,6 +80,11 @@ export async function configuration(environment: NodeJS.ProcessEnv, cwd = proces
 }
 
 export function interactionConfiguration(environment: NodeJS.ProcessEnv): InteractionOptions {
+  const preview = (name: string): "auto" | "off" => {
+    const value = environment[name] ?? "auto";
+    if (value !== "auto" && value !== "off") throw new UserError(`${name} must be auto or off; auto never forces unsupported operations.`);
+    return value;
+  };
   const duration = (name: string, fallback: number, minimum: number, unit: number) => {
     const value = Number(environment[name] ?? fallback);
     if (!Number.isSafeInteger(value) || value < minimum || !Number.isSafeInteger(value * unit) || value * unit > 2_000_000_000) {
@@ -91,6 +96,7 @@ export function interactionConfiguration(environment: NodeJS.ProcessEnv): Intera
     statusUpdateMs: duration("BRIDGE_STATUS_UPDATE_SECONDS", 5, 2, 1000),
     followMs: duration("BRIDGE_FOLLOW_HOURS", 24, 1, 3_600_000),
     digestMs: 60_000,
+    threads: preview("BRIDGE_THREADS"), reactions: preview("BRIDGE_REACTIONS"),
   };
 }
 

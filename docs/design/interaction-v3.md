@@ -32,6 +32,42 @@ checks passed for ZIP/menu/icon shape and rejection cases. The source audit
 passed with the explicit new files included. A typed mock and the intentional
 `!home` menu expectation were corrected before these final gates.
 
+Phase 2 implements the safe capability fallback, not an unverified preview
+transport. Both webhook and relay explicitly report no thread-post, native-quote
+or reaction capability; `auto` remains Focus and `off` disables those requests.
+No new REST operation, endpoint operation, dependency or relay capability is
+invented. Persistent session-thread bindings, MRU thread publication, native
+reactions/quotes and the optional remembered-target UI remain withheld behind
+the documented platform/transport evidence gates. This is an intentional
+deviation from the preview wireframes, not an assertion that threading works.
+
+Authenticated containing-chat metadata establishes checked aliases without
+parsing opaque conversation IDs or rewriting old receipt/cursor namespaces.
+Conflicting identities are not merged. An unbound/unknown thread reply is saved
+as an unsent routing intent, with an explicit writable-source or allowed-workspace
+create-and-send action, expiry, once-only receipts and no uncertain retry.
+Original prompt bytes and the original authenticated prompt reference are retained.
+At most 16 new unresolved drafts may wait; this does not limit legacy sessions,
+receipts or outbox rows.
+
+Schema 3 reads schema 1/2 and preserves their obligations. The version bump
+prevents an older schema-2 reader from silently ignoring chat aliases/routing
+semantics. The current Focus header is now an independent surface too: the UI-H1
+regression (approve B from its independent card while Inbox stays selected) clears
+the existing B header's pending controls on the same activity, without expiring
+another request surface. Changing Focus freezes the previous header, not its work.
+
+Phase 1 cold-review corrections are included in Phase 2: expiry rechecks the
+current deadline inside Store serialization without revoking a valid renewal;
+cross-focus read-only History failures visibly retain their own source/intent;
+digests group canonical sources, page at three sources, and split bounded
+64-publication batches fairly. Final signed Activity size is checked before
+claiming members. A local size failure leaves members pending/unclaimed for
+individual delivery, never uncertain. Regressions exercise the actual
+four-source/64-publication case with both Submit and Execute, 66 distinct sources
+with a two-source remainder, and injected final-payload oversize.
+Phase 2 build/typecheck, all 290 offline tests, and the public-source audit passed.
+
 ## Historical design evidence
 
 Status: **proposal for owner review; no feature implementation**.

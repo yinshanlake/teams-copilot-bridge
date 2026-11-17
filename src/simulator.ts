@@ -37,6 +37,7 @@ export interface PreviewMessage {
 
 export class PreviewTransport implements Transport {
   readonly connected = true;
+  readonly capabilities = { threadReplies: false, quotedReplies: false, reactions: false } as const;
   readonly messages = new Map<string, PreviewMessage>();
   readonly listeners = new Set<(message: PreviewMessage) => void>();
 

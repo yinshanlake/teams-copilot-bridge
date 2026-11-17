@@ -5,7 +5,7 @@ import { Actions, isViewNavigation, StaleCardActionError, type ActionClaims } fr
 import { Cards, inputSuffix, latestTranscriptPage, sessionListPage } from "./cards.js";
 import type {
   Answer, AppAdmission, AppAdmissionSeed, BridgeOptions, Card, ConversationPreview, ConversationRecord, ModelChoice, Receipt, Runtime, RuntimeEvent,
-  SessionListView, SessionRecord, Settings, BridgeState, Subscription, OutboxItem,
+  SessionListView, SessionRecord, Settings, BridgeState, Subscription, OutboxItem, IncomingAddress, Outbound,
 } from "./domain.js";
 import { appAdmissionNotice, appSessionCapability, isSessionListView, viewTarget } from "./domain.js";
 import type { TimelineEntry } from "./domain.js";
@@ -15,13 +15,14 @@ import { Store } from "./store.js";
 import { conversationDialogue, sourceTitle } from "./conversation-ui.js";
 import { parseCommand, type Command } from "./commands.js";
 import { newMessageFormat } from "./transport-format.js";
+import { outboundActivity } from "./teams.js";
 import { assertFields, canonicalId, DeliveryError, digest, logError, object, publicError, safeText, sessionName, string, UncertainOperationError, UserError } from "./safety.js";
 import {
-  followDescription, follows, inbox, interactionState, newSurface, observeInteraction, renderInteractionSurface,
+  followDescription, follows, focusHeader, inbox, interactionState, newSurface, observeInteraction, renderInteractionSurface,
   setTurnState, startTurn, surfaceConversation, touchSurface, turnForOrigin,
 } from "./interaction.js";
 
-export type Incoming = { kind: "text"; text: string } | { kind: "action"; data: Record<string, unknown> };
+export type Incoming = ({ kind: "text"; text: string } | { kind: "action"; data: Record<string, unknown> }) & { address?: IncomingAddress };
 const workingCapability = "Bridge-owned native session: send/read/stop, mode/model/effort and scoped owner approvals.";
 const controlCapability = "Persistent owner control session. Only bounded session-management tools are exposed.";
 const livenessFailureNotice = "App live-status refresh failed or timed out; endpoint status is unknown and sending is disabled until a fresh check succeeds. Retained history and navigation remain available.";
@@ -118,8 +119,21 @@ export class Bridge {
       });
     }
     await this.store.mutate((state) => {
-      if (this.options.interaction) interactionState(state);
-      for (const conversation of Object.values(state.conversations)) conversation.surfaceId = randomUUID();
+      if (this.options.interaction) {
+        const ui = interactionState(state);
+        ui.capabilityNotice = `Focus mode. Threads ${this.options.interaction.threads === "off" ? "disabled" : "unavailable on this validated transport"}; ` +
+          `reactions ${this.options.interaction.reactions === "off" ? "disabled" : "unavailable"}. Native quoted replies are not enabled.`;
+      }
+      for (const conversation of Object.values(state.conversations)) {
+        conversation.surfaceId = randomUUID();
+        if (this.options.interaction && conversation.selectedId && state.sessions[conversation.selectedId]) {
+          const header = focusHeader(state, conversation.key, conversation.selectedId);
+          if (!header.activityId && conversation.view === "dashboard" && conversation.dashboardId && conversation.dashboardState === "ready") {
+            header.activityId = conversation.dashboardId; header.delivery = "ready";
+            delete conversation.dashboardId; delete conversation.dashboardState;
+          }
+        }
+      }
       for (const session of Object.values(state.sessions)) {
         if (session.kind === "owned" || session.kind === "controller") {
           session.status = "offline";
@@ -172,17 +186,40 @@ export class Bridge {
     activityId: string,
     incoming: Incoming,
   ): Promise<Card> {
+    const legacyKey = key;
+    const chatKey = this.options.interaction && incoming.address?.chatId
+      ? digest(`chat:${this.options.owner}:${incoming.address.chatId}`) : undefined;
+    if (this.options.interaction) {
+      const state = this.store.snapshot();
+      key = (chatKey ? state.interaction?.aliases?.[chatKey] : undefined) ??
+        state.interaction?.aliases?.[legacyKey] ?? (state.conversations[legacyKey] ? legacyKey : chatKey ?? legacyKey);
+    }
     const previous = this.conversations.get(key) ?? Promise.resolve();
     let result: Card | undefined;
     const operation = previous.then(async () => {
       if (!this.healthy) throw new UserError("Backend event persistence is unhealthy or shutting down. No new work was accepted.", 503);
       await this.store.mutate((state) => {
+        if (this.options.interaction) {
+          const ui = interactionState(state);
+          const aliases = ui.aliases ??= {};
+          if (legacyKey !== key && state.conversations[legacyKey] ||
+            aliases[legacyKey] !== undefined && aliases[legacyKey] !== key ||
+            chatKey && aliases[chatKey] !== undefined && aliases[chatKey] !== key) {
+            throw new UserError("Conflicting chat identities cannot be merged automatically. Nothing was sent; inspect the original chat.");
+          }
+          aliases[legacyKey] = key;
+          if (chatKey) aliases[chatKey] = key;
+        }
         const existing = state.conversations[key];
+        if (existing?.chatId && incoming.address?.chatId && existing.chatId !== incoming.address.chatId) {
+          throw new UserError("The containing chat identity changed. Nothing was sent or merged.");
+        }
         if (existing) existing.reference = reference;
         else state.conversations[key] = {
           key, reference, revision: 1, view: "home", page: 0, notice: "Choose a working session, or use Control.", surfaceId: randomUUID(),
           read: {},
         };
+        if (incoming.address?.chatId) state.conversations[key]!.chatId = incoming.address.chatId;
         if (this.options.interaction) inbox(state, key);
       });
       const receiptId = digest(`${key}:${activityId}`);
@@ -228,9 +265,11 @@ export class Bridge {
           const command = parseCommand(incoming.text);
           operationName = command?.name ?? "send";
           if (command?.name !== "unsubscribe") livenessFailed = await this.ensureAppLiveness();
-          await this.text(key, incoming.text, [receiptId], command);
+          if (!command && this.options.interaction && incoming.address && incoming.address.place !== "top") {
+            await this.captureRoute(key, incoming.text, receiptId, reference);
+          } else await this.text(key, incoming.text, [receiptId], command);
         }
-        if (this.store.snapshot().receipts[receiptId]?.operation !== "history") {
+        if (!["history", "routing"].includes(this.store.snapshot().receipts[receiptId]?.operation ?? "")) {
           await this.receipt(receiptId, key, operationName, "accepted", "Operation accepted; task completion is reported separately.");
           if (actionReceipt) await this.receipt(actionReceipt, key, operationName, "accepted", "Card action consumed.");
         }
@@ -238,7 +277,7 @@ export class Bridge {
         logError("inbound-operation", error);
         let cancelledHistory = false;
         if (incoming.kind === "text" && /^\s*!use(?:\s|$)/iu.test(incoming.text) ||
-          operationName === "select" && !(error instanceof StaleCardActionError)) {
+          ["select", "route-send", "route-create"].includes(operationName) && !(error instanceof StaleCardActionError)) {
           await this.store.mutate((state) => {
             state.conversations[key]!.selectionBlocked = true;
             state.conversations[key]!.revision++;
@@ -254,7 +293,11 @@ export class Bridge {
         await this.reportOperationError(key, receiptId, detail, error instanceof StaleCardActionError);
       }
       await this.events;
-      if (this.options.interaction) await this.store.mutate((state) => { touchSurface(inbox(state, key), true); });
+      if (this.options.interaction) await this.store.mutate((state) => {
+        touchSurface(inbox(state, key), true);
+        const selected = state.conversations[key]!.selectedId;
+        if (selected && state.sessions[selected]) touchSurface(focusHeader(state, key, selected), true);
+      });
       if (operationName !== "unsubscribe") await this.loadPagePreviews(key);
       if (livenessFailed) await this.notice(key,
         `${livenessFailureNotice} ${this.store.snapshot().conversations[key]!.notice}`);
@@ -273,6 +316,9 @@ export class Bridge {
     if (this.options.interaction && conversation && ["home", "working", "needs-reply"].includes(conversation.view)) {
       return renderInteractionSurface(state, inbox(state, key), this.cards);
     }
+    if (this.options.interaction && conversation?.view === "dashboard" && conversation.selectedId && state.sessions[conversation.selectedId]) {
+      return renderInteractionSurface(state, focusHeader(state, key, conversation.selectedId), this.cards);
+    }
     const targetId = conversation ? viewTarget(state, conversation) : undefined;
     const rendered = this.cards.render(state, key, this.modelCatalogues.get(targetId ?? "") ?? [],
       this.transcriptEntries(state.sessions[targetId ?? ""]), {
@@ -281,24 +327,6 @@ export class Bridge {
         connection: !this.healthy || this.transport.connected === false ? "unavailable"
           : this.transport.connected === true ? "connected" : "ready",
       });
-    if (this.options.interaction && conversation?.view === "dashboard" && conversation.selectedId) {
-      rendered.body.splice(1, 0,
-        { type: "TextBlock", text: `Next message -> ${safeText(state.sessions[conversation.selectedId]?.name ?? conversation.selectedId, 120)}`, wrap: true, weight: "Bolder" },
-        { type: "TextBlock", text: followDescription(state, key, conversation.selectedId), wrap: true, size: "Small" });
-      rendered.actions = [...(rendered.actions ?? []), this.cards.scopedAction(conversation, "Change next target", { op: "view", argument: "sessions" })];
-      if (Buffer.byteLength(JSON.stringify(rendered)) > 27_000) {
-        rendered.body = [
-          { type: "TextBlock", text: `Next message -> ${safeText(state.sessions[conversation.selectedId]?.name ?? conversation.selectedId, 120)}`, wrap: true, weight: "Bolder" },
-          { type: "TextBlock", text: followDescription(state, key, conversation.selectedId), wrap: true },
-          { type: "TextBlock", text: "Details exceed Teams' card budget. Pending requests have separately scoped cards; use History for source content.", wrap: true },
-        ];
-        rendered.actions = [
-          this.cards.scopedAction(conversation, "Change next target", { op: "view", argument: "sessions" }),
-          this.cards.scopedAction(conversation, "History", { op: "view", argument: "transcript", targetId: conversation.selectedId }),
-          this.cards.scopedAction(conversation, "Inbox", { op: "view", argument: "home" }),
-        ];
-      }
-    }
     return rendered;
   }
 
@@ -496,7 +524,7 @@ export class Bridge {
   ): Promise<void> {
     await this.store.mutate((state) => {
       const conversation = state.conversations[key]!;
-      if (history && (conversation.selectionBlocked || conversation.selectedId !== history.sessionId ||
+      if (history && (!conversation.historyRead?.readOnlyTarget && (conversation.selectionBlocked || conversation.selectedId !== history.sessionId) ||
         conversation.historyRead?.id !== history.id || conversation.historyRead.sessionId !== history.sessionId ||
         conversation.historyRead.status !== "failed")) return;
       conversation.notice = safeText(refreshCard
@@ -507,7 +535,7 @@ export class Bridge {
         delete conversation.dashboardState;
         conversation.surfaceId = randomUUID();
       }
-      const sessionId = conversation.selectedId ?? state.controllerId;
+      const sessionId = history?.sessionId ?? conversation.selectedId ?? state.controllerId;
       if (!sessionId) throw new Error("Cannot report an operation without a controller.");
       const eventId = `operation-error:${receiptId}`;
       const id = digest(`${key}:${eventId}`);
@@ -619,6 +647,9 @@ export class Bridge {
       if (view === "control" || (view === "transcript" && transcriptId === state.controllerId)) conversation.notice = "Control view/history does not change the message destination. Ordinary text goes to the selected working session; optional management requires !control <instruction>.";
       else if (conversation.selectedId) conversation.notice = "Ordinary text goes unchanged to the selected working session.";
       if (conversation.selectedId && view !== "control") conversation.read[conversation.selectedId] = state.sessions[conversation.selectedId]?.sequence ?? 0;
+      if (this.options.interaction && conversation.selectedId && state.sessions[conversation.selectedId]) {
+        touchSurface(focusHeader(state, key, conversation.selectedId), true);
+      }
     });
   }
 
@@ -639,6 +670,41 @@ export class Bridge {
       await this.store.mutate((state) => { state.conversations[key]!.sideParentId = claims.targetId!; });
     }
     switch (claims.op) {
+      case "digest-page":
+        assertFields(data, ["token"]);
+        if (!claims.argument || !/^\d{1,4}$/u.test(claims.argument)) throw new UserError("Invalid digest page.");
+        await this.store.mutate((state) => {
+          this.actions.requireCurrent(claims, this.actionConversation(state, key, claims));
+          const surface = state.interaction?.surfaces[claims.surfaceId ?? ""];
+          const item = state.outbox.find((entry) => entry.id === surface?.outboxId);
+          if (surface?.kind !== "digest" || !item?.digest || item.conversationKey !== key) throw new UserError("Digest scope changed.");
+          const sources = new Set(item.digest.memberIds.flatMap((id) =>
+            state.outbox.find((entry) => entry.id === id)?.sessionId ?? []));
+          const page = Number(claims.argument);
+          if (page >= Math.ceil(sources.size / 3)) throw new UserError("Digest page is unavailable.");
+          surface.page = page; surface.revision++; touchSurface(surface, true);
+        });
+        return;
+      case "route-send":
+      case "route-create":
+        await this.sendRoute(key, claims, data, receiptIds);
+        return;
+      case "route-refresh": {
+        assertFields(data, ["token"]);
+        await this.store.mutate((state) => {
+          const route = state.interaction?.routes?.[claims.argument ?? ""];
+          if (!route || route.conversationKey !== key || route.state !== "pending" || route.expiresAt <= Date.now()) {
+            throw new UserError("This draft expired or was already attempted. It cannot be replayed.");
+          }
+          const surface = state.interaction!.surfaces[route.surfaceId]!;
+          if (surface.delivery === "uncertain" || surface.delivery === "rejected") {
+            surface.frozen = "Replaced by an explicitly requested routing card.";
+            surface.revision++;
+            route.surfaceId = newSurface(state, key, "routing", { routingId: route.id }).id;
+          } else { surface.revision++; touchSurface(surface, true); }
+        });
+        return;
+      }
       case "inbox":
         assertFields(data, ["token"]);
         await this.showHome(key, claims.argument !== "refresh");
@@ -1033,7 +1099,7 @@ export class Bridge {
     }
   }
 
-  private async sendWorking(key: string, id: string, text: string, receiptIds: string[]): Promise<void> {
+  private async sendWorking(key: string, id: string, text: string, receiptIds: string[], origin?: ConversationReference): Promise<void> {
     if (this.store.snapshot().conversations[key]?.selectionBlocked) {
       throw new UserError("Destination unresolved after an unsuccessful !use. New work is blocked; choose a valid source with !use <canonical ID>. The previous selection was preserved, not used.");
     }
@@ -1059,13 +1125,13 @@ export class Bridge {
           if (oldest) delete state.directOrigins[oldest.id];
         }
         state.directOrigins[originId] = { id: originId, sessionId: id, conversationKey: key, status: "admitting", at: Date.now() };
-        if (this.options.interaction) startTurn(state, key, id, originId);
+        if (this.options.interaction) startTurn(state, key, id, originId, origin);
       });
       gate = new Promise<void>((resolve) => { acknowledge = resolve; });
       this.directAcks.set(id, gate);
     }
     if (!gate && this.options.interaction) {
-      await this.store.mutate((state) => { startTurn(state, key, id, originId); });
+      await this.store.mutate((state) => { startTurn(state, key, id, originId, origin); });
       gate = new Promise<void>((resolve) => { acknowledge = resolve; });
       this.directAcks.set(id, gate);
     }
@@ -1152,6 +1218,7 @@ export class Bridge {
       conversation.read[id] = state.sessions[id]!.sequence;
       delete conversation.modelKey;
       conversation.notice = "View switched. Other sessions were not stopped.";
+      if (this.options.interaction) touchSurface(focusHeader(state, key, id), true);
     });
   }
 
@@ -1244,6 +1311,124 @@ export class Bridge {
     if (failure && mode === "explicit") throw new UserError(detail);
   }
 
+  private async captureRoute(key: string, prompt: string, receiptId: string, reference: ConversationReference): Promise<void> {
+    await this.store.mutate((state) => {
+      const ui = interactionState(state);
+      const routes = ui.routes ??= {};
+      if (Object.values(routes).filter((route) => route.state === "pending" && route.expiresAt > Date.now()).length >= 16) {
+        throw new UserError("Sixteen unrouted drafts are pending. Nothing was sent; resolve an existing draft first.");
+      }
+      const id = digest(`routing:${key}:${receiptId}`);
+      if (routes[id]) throw new UserError("This draft was already captured. No action was repeated.");
+      const surface = newSurface(state, key, "routing", { routingId: id });
+      routes[id] = {
+        id, conversationKey: key, surfaceId: surface.id, receiptId, reference: structuredClone(reference), prompt,
+        expiresAt: Date.now() + (this.options.actionTtlMs ?? 15 * 60_000), state: "pending",
+      };
+      const receipt = state.receipts[receiptId]!;
+      receipt.operation = "routing"; receipt.status = "applied";
+      receipt.detail = "Draft retained without forwarding. Choose a target on its routing card.";
+      state.conversations[key]!.notice = "This thread has no verified session binding. Your draft is retained; choose its target before it can be sent.";
+      touchSurface(inbox(state, key), true);
+    });
+  }
+
+  private async sendRoute(key: string, claims: ActionClaims, data: Record<string, unknown>, receiptIds: string[]): Promise<void> {
+    assertFields(data, ["token", "source", "target", "workspace", "sessionName"]);
+    const snapshot = this.store.snapshot();
+    const route = snapshot.interaction?.routes?.[claims.argument ?? ""];
+    if (!route || route.conversationKey !== key || snapshot.interaction?.surfaces[claims.surfaceId ?? ""]?.routingId !== route.id ||
+      route.state !== "pending" || route.expiresAt <= Date.now()) {
+      throw new StaleCardActionError("This routing request expired or was already attempted. It cannot be replayed.");
+    }
+    let target: string | undefined;
+    let name: string | undefined;
+    let workspace: string | undefined;
+    if (claims.op === "route-send") {
+      for (const field of ["source", "target"]) {
+        const value = data[field];
+        if (value !== undefined && value !== null && (typeof value !== "string" || value.length > 220)) {
+          throw new UserError("Choose one known source or enter its exact name/ID.");
+        }
+      }
+      const choice = typeof data.source === "string" ? data.source.trim() : "";
+      const typed = typeof data.target === "string" ? data.target.trim() : "";
+      if (choice && typed) throw new UserError("Choose a recent source OR type a source, not both. Refresh this routing card to try again.");
+      const matches = this.resolveSource(choice || typed);
+      if (matches.length !== 1) throw new UserError("Routing target is missing or ambiguous. Nothing was sent; refresh the routing card and select its exact source.");
+      const source = matches[0]!;
+      if ((source.kind !== "owned" && source.kind !== "peer") || source.access?.send === false ||
+        source.peerSource === "app" && (source.access?.read === false || (source.liveUntil ?? 0) <= Date.now())) {
+        throw new UserError("This routing target is read-only. Nothing was sent; refresh the card and choose a writable source.");
+      }
+      if (source.pending.length) throw new UserError("This source needs its exact pending response before another task. Nothing was sent.");
+      target = matches[0]!.id;
+    } else {
+      name = sessionName(data.sessionName);
+      if (!string(data.workspace, 50) || !this.options.workspaces.some((item) => item.id === data.workspace)) {
+        throw new UserError("Select an allowed workspace. Nothing was created or sent.");
+      }
+      workspace = data.workspace;
+    }
+    await this.store.mutate((state) => {
+      this.actions.requireCurrent(claims, this.actionConversation(state, key, claims));
+      const current = state.interaction!.routes![route.id]!;
+      if (current.state !== "pending" || current.expiresAt <= Date.now()) throw new StaleCardActionError("This draft is no longer pending.");
+      current.state = "sending";
+      const surface = state.interaction!.surfaces[current.surfaceId]!;
+      surface.revision++; touchSurface(surface, true);
+    });
+    try {
+      target ??= await this.create(key, name!, workspace!);
+      await this.select(key, target);
+      await this.store.mutate((state) => { state.interaction!.routes![route.id]!.sessionId = target!; });
+      await this.sendWorking(key, target, route.prompt, [route.receiptId, ...receiptIds], route.reference);
+      await this.store.mutate((state) => {
+        const current = state.interaction!.routes![route.id]!;
+        current.state = "sent";
+        const receipt = state.receipts[route.receiptId]!;
+        receipt.operation = "send"; receipt.status = "accepted";
+        receipt.detail = "The original draft was admitted once. Completion and Teams delivery remain separate.";
+        const surface = state.interaction!.surfaces[current.surfaceId]!;
+        surface.revision++; touchSurface(surface, true);
+      });
+    } catch (error) {
+      const uncertain = error instanceof UncertainOperationError || !(error instanceof UserError);
+      await this.store.mutate((state) => {
+        const current = state.interaction!.routes![route.id]!;
+        current.state = uncertain ? "uncertain" : "rejected";
+        const receipt = state.receipts[route.receiptId]!;
+        receipt.status = uncertain ? "uncertain" : "failed";
+        receipt.detail = safeText(publicError(error), 500);
+        const surface = state.interaction!.surfaces[current.surfaceId]!;
+        surface.revision++; touchSurface(surface, true);
+      });
+      if (uncertain && !(error instanceof UncertainOperationError)) {
+        logError("routing-admission", error);
+        throw new UncertainOperationError("The routing operation may have been accepted. Inspect the original host; it will not be replayed.");
+      }
+      throw error;
+    }
+  }
+
+  private async expireRoutes(): Promise<void> {
+    const expired = Object.values(this.store.snapshot().interaction?.routes ?? {}).filter((route) =>
+      route.state === "pending" && route.expiresAt <= Date.now());
+    if (!expired.length) return;
+    await this.store.mutate((state) => {
+      for (const route of expired) {
+        const current = state.interaction!.routes![route.id]!;
+        if (current.state !== "pending") continue;
+        current.state = "expired";
+        state.receipts[current.receiptId]!.detail = "Routing expired. No prompt was sent.";
+        const surface = state.interaction!.surfaces[current.surfaceId]!;
+        surface.revision++; touchSurface(surface, true);
+        touchSurface(inbox(state, current.conversationKey), true);
+      }
+    });
+    for (const route of expired) this.schedule(route.conversationKey);
+  }
+
   private async expireFollows(): Promise<void> {
     if (!this.options.interaction) return;
     const expired = Object.values(this.store.snapshot().interaction?.follows ?? {}).filter((entry) =>
@@ -1252,7 +1437,8 @@ export class Bridge {
     await this.store.mutate((state) => {
       for (const prior of expired) {
         const current = state.interaction?.follows[prior.id];
-        if (!current || current.revision !== prior.revision || current.mode !== "automatic") continue;
+        if (!current || current.revision !== prior.revision || current.mode !== "automatic" ||
+          current.expiresAt === undefined || current.expiresAt > Date.now()) continue;
         current.mode = "muted"; current.revision++;
         current.detail = "Automatic following expired. Explicit task replies remain enabled.";
         const subscription = state.subscriptions[prior.id];
@@ -1304,6 +1490,7 @@ export class Bridge {
     const state = this.store.snapshot();
     const now = Date.now();
     const times = [
+      ...Object.values(state.interaction?.routes ?? {}).flatMap((route) => route.state === "pending" ? [route.expiresAt] : []),
       ...Object.values(state.interaction?.follows ?? {}).flatMap((entry) =>
         entry.mode === "automatic" && entry.expiresAt !== undefined ? [entry.expiresAt] : []),
       ...Object.values(state.interaction?.surfaces ?? {}).flatMap((surface) =>
@@ -1375,6 +1562,9 @@ export class Bridge {
         conversation.page = 0;
         conversation.revision++;
         conversation.read[sessionId] = state.sessions[sessionId]!.sequence;
+        if (this.options.interaction && conversation.selectedId && state.sessions[conversation.selectedId]) {
+          touchSurface(focusHeader(state, key, conversation.selectedId), true);
+        }
         conversation.notice = `${superseded ? "Previous history superseded. " : ""}${readOnlyTarget ? "Reading" : "Selected"} ${safeText(target.name, 100)}. Reading up to ${count} meaningful messages; no task was sent.${readOnlyTarget ? " Next-message target is unchanged." : ""}`;
         for (const receiptId of receiptIds) {
           const receipt = state.receipts[receiptId];
@@ -1854,23 +2044,42 @@ export class Bridge {
 
   private async prepareDigests(key: string): Promise<void> {
     await this.store.mutate((state) => {
-      const candidates = state.outbox.filter((item) => item.conversationKey === key && item.status === "pending" &&
+      let candidates = state.outbox.filter((item) => item.conversationKey === key && item.status === "pending" &&
         item.publication && !item.direct && !item.admissionId && !item.digestId && this.passiveEligible(state, item))
         .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
-      const first = candidates[0];
-      if (!first) return;
-      const members = candidates.filter((item) =>
-        (item.createdAt ?? 0) <= (first.createdAt ?? 0) + (this.options.interaction?.digestMs ?? 60_000)).slice(0, 64);
-      if (new Set(members.map((item) => item.sessionId)).size < 3) return;
-      const id = digest(`digest:${key}:${members.map((item) => item.id).join(":")}`);
-      if (state.outbox.some((item) => item.id === id)) return;
-      const surface = newSurface(state, key, "digest", { outboxId: id });
-      state.outbox.push({
-        id, conversationKey: key, sessionId: first.sessionId, eventId: `digest:${id}`,
-        text: "Followed sessions have new replies.", status: "pending", createdAt: Date.now(),
-        digest: { version: 1, memberIds: members.map((item) => item.id), surfaceId: surface.id },
-      });
-      for (const member of members) member.digestId = id;
+      while (candidates.length) {
+        const first = candidates[0]!;
+        const boundary = (first.createdAt ?? 0) + (this.options.interaction?.digestMs ?? 60_000);
+        const window = candidates.filter((item) => (item.createdAt ?? 0) <= boundary);
+        const groups = new Map<string, OutboxItem[]>();
+        for (const item of window) {
+          const group = groups.get(item.sessionId) ?? [];
+          group.push(item); groups.set(item.sessionId, group);
+        }
+        if (groups.size < 3) { candidates = candidates.filter((item) => (item.createdAt ?? 0) > boundary); continue; }
+        const members: OutboxItem[] = [];
+        const selected = [...groups.values()].slice(0, 64);
+        for (let round = 0; members.length < 64; round++) {
+          let found = false;
+          for (const group of selected) {
+            const item = group[round];
+            if (item) { members.push(item); found = true; }
+            if (members.length === 64) break;
+          }
+          if (!found) break;
+        }
+        const ids = new Set(members.map((item) => item.id));
+        candidates = candidates.filter((item) => !ids.has(item.id));
+        const id = digest(`digest:${key}:${members.map((item) => item.id).join(":")}`);
+        if (state.outbox.some((item) => item.id === id)) continue;
+        const surface = newSurface(state, key, "digest", { outboxId: id });
+        state.outbox.push({
+          id, conversationKey: key, sessionId: first.sessionId, eventId: `digest:${id}`,
+          text: "Followed sessions have new replies.", status: "pending", createdAt: Date.now(),
+          digest: { version: 1, memberIds: members.map((item) => item.id), surfaceId: surface.id },
+        });
+        for (const member of members) member.digestId = id;
+      }
     });
   }
 
@@ -1888,7 +2097,8 @@ export class Bridge {
       const snapshot = this.store.snapshot();
       const current = snapshot.interaction?.surfaces[surface.id];
       if (!current || current.delivery !== surface.delivery || current.renderedVersion === current.version) continue;
-      const reference = snapshot.interaction?.turns[current.turnId ?? ""]?.reference ?? snapshot.conversations[key]!.reference;
+      const reference = snapshot.interaction?.turns[current.turnId ?? ""]?.reference ??
+        snapshot.interaction?.routes?.[current.routingId ?? ""]?.reference ?? snapshot.conversations[key]!.reference;
       const body = renderInteractionSurface(snapshot, current, this.cards);
       if (Buffer.byteLength(JSON.stringify(body)) > 27_000) {
         await this.notice(key, "A detailed interaction card exceeds Teams' size limit. Use !status or !history; no action was approved.");
@@ -1943,6 +2153,7 @@ export class Bridge {
   private async deliver(): Promise<void> {
     if (!this.deliveryEnabled) return;
     await this.expireFollows();
+    await this.expireRoutes();
     const keys = [...this.dirty];
     this.dirty.clear();
     for (const key of keys) {
@@ -1950,12 +2161,35 @@ export class Bridge {
       if (!conversation) continue;
       if (this.options.interaction) await this.prepareDigests(key);
       for (const item of this.store.snapshot().outbox.filter((entry) => entry.conversationKey === key && entry.status === "pending" && !entry.digestId)) {
+        const surfaceId = item.publication?.surfaceId ?? item.digest?.surfaceId;
+        const snapshot = this.store.snapshot();
+        const surface = surfaceId ? snapshot.interaction?.surfaces[surfaceId] : undefined;
+        if (surfaceId && !surface) throw new Error("Missing persisted result surface.");
+        const message: Outbound = surface ? {
+          type: "card", card: renderInteractionSurface(snapshot, surface, this.cards),
+          summary: item.digest ? "Followed Copilot sessions have new replies." : `Copilot reply - ${item.publication!.title}`,
+        } : { type: "text", text: item.text, ...(item.presentation ? { presentation: item.presentation } : {}) };
+        if (message.type === "card" && Buffer.byteLength(JSON.stringify(outboundActivity(message))) > 27_000) {
+          logError("outbox-card-budget", new UserError("Signed card exceeds the outbound payload budget."));
+          await this.store.mutate((state) => {
+            const current = state.outbox.find((entry) => entry.id === item.id)!;
+            if (current.status !== "pending") return;
+            if (current.digest) this.releasePendingDigest(state, current.id);
+            current.status = "rejected"; current.detail = "Local payload budget rejection; no transport call was made.";
+            if (surfaceId) state.interaction!.surfaces[surfaceId]!.delivery = "rejected";
+            state.conversations[key]!.notice = current.digest
+              ? "Digest exceeded the payload budget. Its unclaimed notifications remain queued for individual delivery."
+              : "Result card exceeds the payload budget. The source result remains available through History; no work was replayed.";
+          });
+          this.schedule(key);
+          continue;
+        }
         const claimed = await this.store.mutate((state) => {
           const current = state.outbox.find((entry) => entry.id === item.id)!;
           if (current.status !== "pending") return false;
           if (current.digest) {
             const members = current.digest.memberIds.map((id) => state.outbox.find((entry) => entry.id === id));
-            if (members.some((member) => !member || member.status !== "pending" || !this.passiveEligible(state, member))) {
+            if (members.some((member) => !member || member.status !== "pending" || member.direct || member.admissionId || !this.passiveEligible(state, member))) {
               this.releasePendingDigest(state, current.id);
               this.schedule(key);
               return false;
@@ -1988,14 +2222,8 @@ export class Bridge {
         });
         if (!claimed) continue;
         try {
-          const surfaceId = item.publication?.surfaceId ?? item.digest?.surfaceId;
-          const snapshot = this.store.snapshot();
-          const surface = surfaceId ? snapshot.interaction?.surfaces[surfaceId] : undefined;
-          if (surfaceId && !surface) throw new Error("Missing persisted result surface.");
-          const activityId = await this.transport.send(item.originReference ?? conversation.reference, surface ? {
-            type: "card", card: renderInteractionSurface(snapshot, surface, this.cards),
-            summary: item.digest ? "Followed Copilot sessions have new replies." : `Copilot reply - ${item.publication!.title}`,
-          } : { type: "text", text: item.text, ...(item.presentation ? { presentation: item.presentation } : {}) });
+          const claimedItem = this.store.snapshot().outbox.find((entry) => entry.id === item.id)!;
+          const activityId = await this.transport.send(claimedItem.originReference ?? conversation.reference, message);
           await this.store.mutate((state) => {
             const current = state.outbox.find((entry) => entry.id === item.id)!;
             current.status = "sent";
@@ -2047,7 +2275,7 @@ export class Bridge {
       }
       if (this.options.interaction) {
         await this.deliverInteractionSurfaces(key);
-        if (["home", "working", "needs-reply"].includes(this.store.snapshot().conversations[key]!.view)) continue;
+        if (["home", "working", "needs-reply", "dashboard"].includes(this.store.snapshot().conversations[key]!.view)) continue;
       }
       try {
         const current = this.store.snapshot().conversations[key]!;

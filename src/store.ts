@@ -70,15 +70,25 @@ function interaction(value: unknown): boolean {
   if (value === undefined) return true;
   const integer = (entry: unknown, minimum = 0) => Number.isSafeInteger(entry) && Number(entry) >= minimum;
   if (!object(value) || !object(value.surfaces) || !object(value.turns) || !object(value.follows) || !object(value.active)) return false;
+  if (value.capabilityNotice !== undefined && !string(value.capabilityNotice, 2000)) return false;
+  if (value.aliases !== undefined && (!object(value.aliases) || !Object.entries(value.aliases).every(([key, target]) =>
+    /^[a-f0-9]{64}$/u.test(key) && string(target, 512)))) return false;
+  if (value.routes !== undefined && (!object(value.routes) || !Object.entries(value.routes).every(([id, route]) =>
+    object(route) && route.id === id && string(id, 64) && string(route.conversationKey, 512) &&
+    canonicalId(route.surfaceId) && string(route.receiptId, 64) && object(route.reference) &&
+    string(route.prompt, 64_000) && integer(route.expiresAt) &&
+    ["pending", "sending", "sent", "uncertain", "rejected", "expired"].includes(String(route.state)) &&
+    (route.sessionId === undefined || canonicalId(route.sessionId))))) return false;
   return Object.entries(value.surfaces).every(([id, item]) =>
     canonicalId(id) && object(item) && item.id === id && string(item.conversationKey) &&
-    ["inbox", "turn", "request", "result", "digest"].includes(String(item.kind)) &&
+    ["inbox", "header", "turn", "request", "result", "digest", "routing"].includes(String(item.kind)) &&
     integer(item.revision, 1) && integer(item.version, 1) && typeof item.urgent === "boolean" &&
     ["pending", "sending", "ready", "uncertain", "rejected"].includes(String(item.delivery)) &&
     (item.sessionId === undefined || canonicalId(item.sessionId)) &&
-    ["turnId", "requestId", "outboxId", "activityId", "frozen"].every((key) => item[key] === undefined || string(item[key], 2048)) &&
+    ["turnId", "requestId", "outboxId", "routingId", "activityId", "frozen"].every((key) => item[key] === undefined || string(item[key], 2048)) &&
     (item.renderedVersion === undefined || integer(item.renderedVersion)) &&
     (item.retryAt === undefined || integer(item.retryAt)) &&
+    (item.page === undefined || integer(item.page)) &&
     (item.lastUpdatedAt === undefined || integer(item.lastUpdatedAt))) &&
     Object.entries(value.turns).every(([id, item]) => string(id) && object(item) && item.id === id &&
       string(item.conversationKey) && canonicalId(item.sessionId) && canonicalId(item.surfaceId) &&
@@ -98,7 +108,7 @@ function interaction(value: unknown): boolean {
 }
 
 function isState(value: unknown, owner: string): value is BridgeState {
-  if (!object(value) || (value.schema !== 1 && value.schema !== 2) || value.owner !== owner || typeof value.actionKey !== "string" ||
+  if (!object(value) || (value.schema !== 1 && value.schema !== 2 && value.schema !== 3) || value.owner !== owner || typeof value.actionKey !== "string" ||
     !/^[A-Za-z0-9_-]{43}$/.test(value.actionKey) || (value.controllerId !== undefined && !canonicalId(value.controllerId))) return false;
   if (!object(value.sessions) || !object(value.conversations) || !object(value.receipts) ||
     !Array.isArray(value.outbox) || !admissions(value.admissions) || !interaction(value.interaction)) return false;
@@ -130,6 +140,7 @@ function isState(value: unknown, owner: string): value is BridgeState {
       Number.isSafeInteger(item.revision) && ["home", "dashboard", "sessions", "working", "needs-reply", "sides", "subscriptions", "new", "settings", "control", "transcript"].includes(String(item.view)) &&
       (item.surfaceId === undefined || canonicalId(item.surfaceId)) &&
       (item.actionVersion === undefined || item.actionVersion === 2) &&
+      (item.chatId === undefined || string(item.chatId, 2048)) &&
       (item.query === undefined || (typeof item.query === "string" && item.query.length <= 100)) &&
       (item.historyRead === undefined || object(item.historyRead) && string(item.historyRead.id, 64) &&
         canonicalId(item.historyRead.sessionId) && Number.isSafeInteger(item.historyRead.count) &&
@@ -200,11 +211,11 @@ export class Store {
         if ((await stat(statePath)).size > 64 * 1024 * 1024) throw new Error("Bridge state exceeds the 64 MiB startup budget; inspect/archive it manually.");
         const parsed: unknown = JSON.parse(await readFile(statePath, "utf8"));
         if (!isState(parsed, owner)) throw new Error("State schema/owner mismatch; refusing to replace state.");
-        state = { ...parsed, schema: 2, admissions: parsed.admissions ?? {}, subscriptions: parsed.subscriptions ?? {}, directOrigins: parsed.directOrigins ?? {} };
+        state = { ...parsed, schema: 3, admissions: parsed.admissions ?? {}, subscriptions: parsed.subscriptions ?? {}, directOrigins: parsed.directOrigins ?? {} };
       } catch (error) {
         if (!object(error) || error.code !== "ENOENT") throw error;
         state = {
-          schema: 2, owner, actionKey: randomBytes(32).toString("base64url"),
+          schema: 3, owner, actionKey: randomBytes(32).toString("base64url"),
           sessions: {}, conversations: {}, receipts: {}, outbox: [], admissions: {}, subscriptions: {}, directOrigins: {},
         };
       }
@@ -213,6 +224,10 @@ export class Store {
       await store.mutate((draft) => {
         if (draft.interaction) {
           draft.interaction.active = {};
+          for (const route of Object.values(draft.interaction.routes ?? {})) {
+            if (route.state === "sending") route.state = "uncertain";
+            else if (route.state === "pending" && route.expiresAt <= Date.now()) route.state = "expired";
+          }
           for (const turn of Object.values(draft.interaction.turns)) {
             if (["admitting", "accepted", "executing", "waiting"].includes(turn.state)) turn.state = "uncertain";
           }

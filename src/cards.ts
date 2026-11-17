@@ -230,6 +230,14 @@ export class Cards {
     return this.execute(conversation, title, scope, inputs);
   }
 
+  newSessionInputs(): Record<string, unknown>[] {
+    return [
+      { type: "Input.Text", id: "sessionName", label: "Session name", isRequired: true, maxLength: 100, errorMessage: "Enter a name." },
+      { type: "Input.ChoiceSet", id: "workspace", label: "Allowed workspace", isRequired: true,
+        value: this.workspaces[0]?.id, choices: this.workspaces.map((workspace) => ({ title: workspace.name, value: workspace.id })) },
+    ];
+  }
+
   requestSurface(conversation: ConversationRecord, target: SessionRecord, pending: PendingRequest): Card {
     const body = [block(`${target.name} needs you`, { weight: "Bolder" }), block(target.id, { size: "Small" })];
     this.request(body, conversation, target, pending);
@@ -445,11 +453,7 @@ export class Cards {
       }
       case "new":
         body.push(
-          { type: "Input.Text", id: "sessionName", label: "Session name", isRequired: true, maxLength: 100, errorMessage: "Enter a name." },
-          {
-            type: "Input.ChoiceSet", id: "workspace", label: "Allowed workspace", isRequired: true,
-            value: this.workspaces[0]?.id, choices: this.workspaces.map((workspace) => ({ title: workspace.name, value: workspace.id })),
-          },
+          ...this.newSessionInputs(),
           block("Manual approvals stay on. No task runs until you send one.", { size: "Small", isSubtle: true }),
         );
         navigation.push(execute("Create", { op: "create" }, true), execute("Back", { op: "view", argument: selected ? "dashboard" : "sessions" }));

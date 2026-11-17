@@ -2,8 +2,8 @@ import express, { type ErrorRequestHandler } from "express";
 import { Activity, ActivityTypes, type ConversationReference } from "@microsoft/agents-activity";
 import { CloudAdapter, authorizeJWT, getAuthConfigWithDefaults, type AuthConfiguration, type Request as AgentRequest, type TurnContext } from "@microsoft/agents-hosting";
 import type { Bridge, Incoming } from "./bridge.js";
-import type { Card, Outbound, Transport } from "./domain.js";
-import { digest, logError, object, publicError, string, UserError } from "./safety.js";
+import type { Card, IncomingAddress, Outbound, Transport } from "./domain.js";
+import { digest, logError, object, publicError, safeText, string, UserError } from "./safety.js";
 import { replyActivityFields } from "./replies.js";
 
 export interface TeamsIdentity {
@@ -32,6 +32,7 @@ export function allowedServiceUrl(value: unknown, hosts: readonly string[]): boo
 }
 
 export function incomingActivity(activity: Activity): Incoming {
+  const address = activityAddress(activity);
   if (activity.type === ActivityTypes.Invoke) {
     const value: unknown = activity.value;
     if (activity.name !== "adaptiveCard/action" || !object(value) || !object(value.action) ||
@@ -39,17 +40,40 @@ export function incomingActivity(activity: Activity): Incoming {
       (value.trigger !== undefined && value.trigger !== "manual")) {
       throw new UserError("Unsupported or malformed Adaptive Card invoke.");
     }
-    return { kind: "action", data: value.action.data };
+    return { kind: "action", data: value.action.data, ...(address ? { address } : {}) };
   }
   if (activity.type !== ActivityTypes.Message) throw new UserError("Only text messages and scoped card actions are supported.", 400);
   if (activity.attachments?.length) throw new UserError("v1 accepts text and its own card forms, not uploaded attachments.");
   const value: unknown = activity.value;
   if (value !== undefined && value !== null) {
     if (!object(value) || !string(value.token, 4096)) throw new UserError("Malformed Action.Submit payload.");
-    return { kind: "action", data: value };
+    return { kind: "action", data: value, ...(address ? { address } : {}) };
   }
   if (typeof activity.text !== "string") throw new UserError("A text message is required.");
-  return { kind: "text", text: activity.text };
+  return { kind: "text", text: activity.text, ...(address ? { address } : {}) };
+}
+
+function activityAddress(activity: Activity): IncomingAddress | undefined {
+  if (!object(activity.channelData)) return undefined;
+  const data = activity.channelData;
+  const validId = (value: unknown) => string(value, 2048) && !/[\u0000-\u001f\u007f]/u.test(value);
+  if (data.chat !== undefined && (!object(data.chat) || !validId(data.chat.id)) ||
+    data.replyChain !== undefined && (!object(data.replyChain) || !validId(data.replyChain.id))) {
+    throw new UserError("Malformed containing-chat or reply-chain identity. Nothing was routed.");
+  }
+  const chatId = object(data.chat) && typeof data.chat.id === "string" ? data.chat.id : undefined;
+  const rootId = object(data.replyChain) && typeof data.replyChain.id === "string" ? data.replyChain.id : undefined;
+  if (!chatId && !rootId) return undefined;
+  let messageId = activity.id;
+  if (activity.type === ActivityTypes.Invoke || data.source !== undefined) {
+    const value: unknown = activity.value;
+    messageId = object(value) && object(value.messagePayload) && typeof value.messagePayload.id === "string"
+      ? value.messagePayload.id : activity.replyToId;
+  }
+  return {
+    ...(chatId ? { chatId } : {}), ...(rootId ? { rootId } : {}),
+    place: !rootId ? "top" : !chatId || !messageId ? "unknown" : messageId === rootId ? "top" : "thread",
+  };
 }
 
 export function authorizeActivity(body: unknown, verifiedClaims: unknown, identity: TeamsIdentity): AuthorizedActivity {
@@ -92,7 +116,7 @@ export function outboundActivity(message: Outbound, id?: string): Activity {
     type: ActivityTypes.Message, ...(id ? { id } : {}),
     ...(message.type === "text"
       ? replyActivityFields(message)
-      : { ...(message.summary ? { text: message.summary, textFormat: "plain" } : {}),
+      : { ...(message.summary ? { text: safeText(message.summary, 1000), textFormat: "plain" } : {}),
         attachments: [{ contentType: "application/vnd.microsoft.card.adaptive", content: message.card }] }),
   });
 }
@@ -111,6 +135,7 @@ type SendContext = Pick<TurnContext, "sendActivity" | "updateActivity">;
 export type ContinueConversation = (reference: ConversationReference, logic: (context: SendContext) => Promise<void>) => Promise<void>;
 
 export class TeamsTransport implements Transport {
+  readonly capabilities = { threadReplies: false, quotedReplies: false, reactions: false } as const;
   constructor(private readonly identity: TeamsIdentity, private readonly continueConversation: ContinueConversation) {}
 
   private validate(reference: ConversationReference): void {
