@@ -2,8 +2,8 @@
 
 A self-hosted, single-owner bridge between a **personal Microsoft Teams bot chat**
 and your local Copilot sessions. Use Teams' normal message composer to talk to an
-explicit, visible Focus target. An Inbox, independently scoped task/request cards,
-and result previews keep control separate from work text.
+explicit, visible Focus target. Quiet acknowledgements, answer-first replies and
+a searchable **All actions** panel keep control separate from work text.
 
 This is an independent project, not an official Microsoft or GitHub product.
 It is not a hosted service or a multi-user bot.
@@ -31,10 +31,11 @@ After [installing your own bot](#6-build-and-import-your-personal-teams-app),
 open its personal chat in Teams on your phone. Keep the computer, original
 Copilot host, bridge backend, and configured network route running.
 
-**These are cropped screenshots of the bundled local MOCK preview, not native
-Teams screenshots.** All names, IDs, requests, and results are synthetic. The
-preview renders the current bridge's cards without Teams credentials, model
-calls, or tool execution. Native Teams and mobile layouts can differ.
+**These are cropped screenshots of an earlier bundled local MOCK layout, not
+native Teams screenshots.** All names, IDs, requests, and results are synthetic.
+The current UI uses the quieter controls described below; run the local preview
+for the current cards without Teams credentials, model calls, or tool execution.
+Native Teams and mobile layouts can differ.
 
 ### 1. Find a session and check the target
 
@@ -49,9 +50,17 @@ That entry, and **All sessions** from the Inbox, now post a fresh picker near
 the latest chat activity instead of editing an old off-screen message.
 Search, page navigation, and Refresh stay on that picker.
 
-Opening the picker alone does **not** switch the target. Choosing **Open**
-selects the source and shows its read-only history; it does not send a task.
-If names are ambiguous, use **`!use <canonical-session-ID>`** instead.
+Opening the picker alone does **not** switch the target. **Open** selects the
+source and posts one compact session card at the bottom of the chat, even if
+you explicitly reopen the same session. It does not send a task, read older
+messages, or post a history snapshot. If names are ambiguous, use
+**`!use <canonical-session-ID>`** instead.
+
+The card shows the source and its observed status. If short public excerpts
+are already available, **You** and **Copilot** have separate labels. Tap **Recent
+conversation** for a bounded, read-only view. To post full-length messages,
+expand **Full history**, choose a count and tap **Post full history**. Longer
+messages may span several chat activities only when you explicitly request them.
 
 ### 2. Send work, then read the result
 
@@ -60,10 +69,12 @@ Use the normal Teams message composer for the task, for example:
 The bridge forwards that text unchanged to the selected writable source.
 Only commands starting with **`!`** control the bridge.
 
-The task card tracks that request separately from its result delivery. A result
-preview identifies the source and original task receipt. Tap **Show full** to
-read the full result without rerunning the task or changing the next target.
-Use **`!history`** to read the selected source's recent conversation.
+Fast replies arrive without an extra task card. A slower task gets one compact
+status activity, updated in place: **Received by bridge**, **Accepted by source**
+or **Running - execution observed** are different facts. This is not a native
+typing indicator. Answers show the actual response first, not a generic task
+completion summary. **Show full** appears only for longer answers. **Details**
+holds source/receipt diagnostics; **All actions** includes history and controls.
 
 ![Local MOCK completed-result card with a source reference and Show full](docs/images/result-demo.png)
 
@@ -84,9 +95,10 @@ or review an offered approval. Stop requires its own confirmation. For
 host; the Inbox does not guess whether that host is waiting for approval.
 See [owned-session controls](#owned-session-controls) for the exact limits.
 
-An accepted task follows its source for 24 hours by default. Use **`!subscribe`**
-for an explicit follow without expiry, or **`!unsubscribe`** to mute passive
-notifications. Muting does not suppress replies to tasks you already sent.
+An accepted task follows its source for 24 hours by default unless you explicitly
+unsubscribed. Use **Subscribe / Unsubscribe** on the header or a picker row;
+these never select a different source or send it work. An explicit unsubscribe
+survives later tasks and restart. It never suppresses direct task replies.
 
 ## Prerequisites and compatibility
 
@@ -281,8 +293,8 @@ and the mobile client; no separate mobile sideload flow is promised.
 | Message | Effect |
 | --- | --- |
 | `!sessions` | Find a source |
-| `!use <name or ID>` | Select that exact source; use its canonical ID if names are ambiguous |
-| `!history` / `!history 20` | Read 10 messages by default, or an explicit count from 1 to 50 |
+| `!use <name or ID>` | Select that exact source and show one compact session card; no automatic history |
+| `!history` / `!history 20` | Post full-length readable messages (10 by default, or an explicit count from 1 to 50) |
 | `!status` | Show the selected source and notification state |
 | `!subscribe` | Follow the exact selected source without expiry; observation is journal-backed or explicitly live-only |
 | `!unsubscribe` | Mute passive notifications, not explicit task replies or outstanding receipts |
@@ -328,23 +340,56 @@ evidence; a busy heartbeat is not a permission request. Native request cards hav
 their own signed surface, so changing focus or refreshing the Inbox does not
 invalidate another pending request.
 
+The Focus header, session picker and Inbox use the same host-derived session
+status text and semantic colors. They update on observed events and catalogue/
+liveness changes even while another view is selected. Session availability is
+not the completion state of an individual task; unknown/read-only states remain
+explicit. The current header offers **Recent conversation**, **Subscribe /
+Unsubscribe**, **Change next target**, and **All actions**. Unsupported subscriptions show their
+reason instead of a pretend working button.
+
 Opening **All sessions** or **Change next target** from an independent Inbox,
 header or task card posts a fresh picker near the latest chat activity. Search,
 pagination and Refresh update that same picker. Opening it does not change the
 selected destination or send work; choose **Open** on the desired session.
 
-An accepted Teams task automatically follows that source for 24 hours, including
-after an earlier Mute. Explicit `!subscribe` has no expiry. App following uses the
+**All actions** is a working, searchable, paged control panel, not just command
+documentation. It is bound to the source from which it was opened, independently
+of the next-message target. It prioritizes Steer/Stop for an observed owned task,
+then groups sessions, notifications, history, model/mode, diagnostics and optional
+explicit Control. Search for `model`, `history`, `approval` or `control` and use
+the offered form. Native questions/approvals retain their exact request IDs;
+Stop still requires a separate confirmation. The Steer opener and submit are
+both bound to the originally offered turn. App-only operations are explained,
+never implemented by assuming ownership. Source IDs, tool/queue details and
+receipts stay under deliberate **Details**. First contact with no target shows
+**Choose a session**, `!sessions` and `!help`; ordinary text is not silently sent.
+
+An accepted Teams task automatically follows that source for 24 hours only if it
+has no explicit unsubscribe preference. Explicit `!subscribe` has no expiry.
+Unsubscribe persists through later tasks and restart; only an explicit Subscribe
+enables it again. Legacy `muted` entries do not identify whether a user muted or
+an automatic period expired: they are preserved without guessing and require
+explicit Subscribe. Newly recorded automatic expiry can renew on later tasks.
+App following uses the
 existing durable local cursor; owned SDK sessions are **live-only**, with no
 automatic reconnect or invented catch-up cursor. Existing paused subscriptions
 stay paused. Following capacity/failures are reported separately from the task's
 direct result obligation.
 
-Results first show a short preview and a **Show full** action. Full content is
-published through the existing measured chunk formatter as read-only history;
-it never resends work or changes the next-message target. A stable task-receipt
-reference supplies context without pretending to be a native server-stamped
-quote. Three or more passive source notifications within 60 seconds can form
+There is a short acknowledgement grace period so a fast actual answer can arrive
+alone. During delayed liveness/connection/send checks, a compact **Received by
+bridge - not yet accepted** hint cannot be mistaken for a native ACK. Slow
+requests use at most one status activity updated in place; no typing activity is
+invented on relay or webhook. The final answer is a separate new activity with
+actual answer text first. Short answers have no redundant Show full button;
+long answers use a bounded preview and **Show full**. Full content is published
+through the existing measured chunk formatter as read-only history. Generic
+native completion summaries never replace answer text. Prior replies keep their
+original source and recipient after switching. Failed/uncertain delivery remains
+explicit and is never automatically replayed.
+
+Three or more passive source notifications within 60 seconds can form
 one digest; direct task replies are never folded into it. Individual passive
 notifications may wait for that collection window.
 Digests group by canonical source, not display title or result count. Larger
@@ -355,10 +400,11 @@ before any member is claimed. Remainders stay queued rather than being lost.
 update immediately. `BRIDGE_FOLLOW_HOURS` defaults to 24 (minimum 1). Values must
 fit the validated timer range. Rendering cards and following do not start an SDK.
 
-The Store now writes **schema 4**. Opening schema 1, 2 or 3 validates the same owner and
+The Store now writes **schema 5**. Opening schema 1, 2, 3 or 4 validates the same owner and
 atomically preserves its sources, receipts, admissions, subscription cursors and
-all legacy outbox bytes/statuses. Earlier readers reject schema 4 rather than
-ignore new routing, approval and confirmation semantics. A controlled
+all legacy outbox bytes/statuses. Earlier readers reject schema 5 rather than
+ignore explicit unsubscribe intent or the independent picker/Actions surfaces.
+No historical uncertain send becomes replayable. A controlled
 upgrade must stop the single writer and retain a consistent private backup.
 After any newly accepted work, restoring an older database is **not a safe
 rollback**: it can lose deduplication and receipt facts. Retain the schema-aware

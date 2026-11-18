@@ -5,7 +5,8 @@ import { Actions, type ActionScope } from "./actions.js";
 import { appAdmissionNotice, isSessionListView, viewTarget } from "./domain.js";
 import { mergeDialoguePreview } from "./projection.js";
 import { chunkText, digest, safeText } from "./safety.js";
-import { conversationDialogue, sourceTitle } from "./conversation-ui.js";
+import { canFollow, conversationDialogue, follows, notificationLabel, sourceTitle } from "./conversation-ui.js";
+import { outboundActivity } from "./teams.js";
 
 const pageSize = 3;
 const modelPageSize = 20;
@@ -74,12 +75,8 @@ export function latestTranscriptPage(entries: TimelineEntry[]): number {
 }
 
 function notificationState(state: BridgeState, key: string, id: string): Record<string, unknown> {
-  const preference = state.interaction?.follows[digest(`${key}:${id}`)];
   if (state.interaction) {
-    const subscription = state.subscriptions[digest(`${key}:${id}`)];
-    const active = preference && preference.mode !== "muted" && (preference.expiresAt === undefined || preference.expiresAt > Date.now());
-    const label = !active ? "Muted" : subscription?.enabled && subscription.status === "paused" ? "Following paused"
-      : preference.observation === "live" ? "Following - live only" : preference.observation === "unavailable" ? "Following unavailable" : "Following";
+    const label = notificationLabel(state, key, id);
     return block(`Notifications: ${label}`, { id: `notification-state-${id}`, size: "Default", weight: "Bolder", spacing: "Small" });
   }
   const subscription = state.subscriptions[digest(`${key}:${id}`)];
@@ -119,7 +116,7 @@ interface SessionAppearance {
   check: boolean;
 }
 
-function sessionStatus(session: SessionRecord, now: number): SessionAppearance {
+export function sessionStatus(session: SessionRecord, now: number): SessionAppearance {
   const status = (text: string, color: SessionAppearance["color"], symbol: string, check = false) => ({ text, color, symbol, check });
   if (session.kind === "controller" && session.status === "offline") return status("Control starts on demand", "Default", "○");
   if (session.peerSource === "app" && session.liveUntil !== undefined && session.liveUntil <= now) {
@@ -149,17 +146,17 @@ function sessionStatus(session: SessionRecord, now: number): SessionAppearance {
   return status(statusNames[session.status], session.status === "busy" ? "Accent" : "Good", "●");
 }
 
-function statusBlock(status: SessionAppearance, prefix = ""): Record<string, unknown> {
+export function statusBlock(status: SessionAppearance, prefix = ""): Record<string, unknown> {
   return block(`${prefix}${status.symbol} ${status.text}`, { weight: "Bolder", color: status.color, spacing: "Small" });
 }
 
-function hasPendingReply(session: SessionRecord, now: number): boolean {
+export function hasPendingReply(session: SessionRecord, now: number): boolean {
   return session.pending.some((pending) => !pending.responseState && (pending.expiresAt === undefined || pending.expiresAt > now)) &&
     session.status !== "offline" && freshEndpoint(session, now) &&
-    (session.kind === "owned" || session.kind === "peer" || session.kind === "controller");
+    (session.kind === "owned" || session.kind === "controller");
 }
 
-function isWorking(session: SessionRecord, now: number): boolean {
+export function isWorking(session: SessionRecord, now: number): boolean {
   return (session.kind === "owned" || session.kind === "peer") && freshEndpoint(session, now) &&
     session.status === "busy" && !session.pending.length &&
     (session.kind !== "owned" || session.executionObserved !== false);
@@ -244,9 +241,16 @@ export class Cards {
   }
 
   requestSurface(conversation: ConversationRecord, target: SessionRecord, pending: PendingRequest): Card {
-    const body = [block(`${target.name} needs you`, { weight: "Bolder" }), block(target.id, { size: "Small" })];
+    const body = [block(`${target.name} needs you`, { weight: "Bolder" })];
     this.request(body, conversation, target, pending);
-    return card(body, [this.execute(conversation, "Inbox", { op: "inbox" })]);
+    return card(body, [this.execute(conversation, "All actions", { op: "all-actions", targetId: target.id })]);
+  }
+
+  settingsSurface(conversation: ConversationRecord, target: SessionRecord, models: ModelChoice[]): Card {
+    const body = [block(`Model and mode - ${target.name}`, { weight: "Bolder" })];
+    this.settings(body, conversation, target, models);
+    if (target.settingsReceipt) body.push(block(`Settings ${target.settingsReceipt.status}: ${target.settingsReceipt.detail}`, { size: "Small" }));
+    return card(body, [this.execute(conversation, "All actions", { op: "actions-section", argument: "menu" })]);
   }
 
   render(state: BridgeState, key: string, models: ModelChoice[] = [], transcript?: TimelineEntry[], context: {
@@ -409,8 +413,9 @@ export class Cards {
               { type: "Column", width: "stretch", items: [
                 block(sourceTitle(session, state.sessions), { weight: "Bolder", spacing: "None", maxLines: 2 }),
                 statusBlock(rowStatus),
-                ...(state.subscriptions[digest(`${key}:${session.id}`)]?.enabled ? [notificationState(state, key, session.id)] : []),
-                block(`${recency(session.lastConversationAt, now)}${unread ? " · New activity" : ""} · ${session.id.slice(0, 8)}`,
+                ...(state.interaction || state.subscriptions[digest(`${key}:${session.id}`)]?.enabled ? [notificationState(state, key, session.id)] : []),
+                block(`${recency(session.lastConversationAt, now)}${unread ? " · New activity" : ""}${!state.interaction ||
+                  owned.some((other) => other.id !== session.id && other.name === session.name) ? ` · ${session.id.slice(0, 8)}` : ""}`,
                   { size: "Small", isSubtle: true, spacing: "None" }),
                 ...(() => {
                   if (context.previewFailures?.has(session.id)) return [
@@ -431,7 +436,9 @@ export class Cards {
                 ...(session.id === selected?.id ? [block("Current", { size: "Small", color: "Accent" })] : []),
                 { type: "ActionSet", spacing: "None", actions: [
                   ...(available ? [{ ...execute("Open", { op: "select", targetId: session.id }), style: "default" }] : []),
-                  ...(conversation.view === "subscriptions" ? [execute("Unsubscribe", { op: "unsubscribe", targetId: session.id })] : []),
+                  ...(state.interaction && (follows(state, key, session.id) || canFollow(session)) ? [execute(follows(state, key, session.id) ? "Unsubscribe" : "Subscribe", {
+                    op: follows(state, key, session.id) ? "unsubscribe" : "subscribe", targetId: session.id,
+                  })] : !state.interaction && conversation.view === "subscriptions" ? [execute("Unsubscribe", { op: "unsubscribe", targetId: session.id })] : []),
                 ] },
               ] },
             ],
@@ -446,7 +453,8 @@ export class Cards {
         navigation.push(
           ...(page > 0 ? [execute("Previous", { op: "page", argument: String(page - 1) })] : []),
           ...(page + 1 < pages ? [execute("Next", { op: "page", argument: String(page + 1) })] : []),
-          execute("Home", { op: "view", argument: "home" }),
+          state.interaction ? execute("All actions", { op: "all-actions", ...(selected ? { targetId: selected.id } : {}) })
+            : execute("Home", { op: "view", argument: "home" }),
           ...(conversation.view === "sides" && conversation.sideParentId && state.sessions[conversation.sideParentId]
             ? [execute("Parent", { op: "select", targetId: conversation.sideParentId })]
             : [
@@ -599,16 +607,20 @@ export class Cards {
       block("No confirmed native message ID. Execution/result remain unknown; this older request cannot be reconciled or replayed.", { size: "Small" }),
       block(unknown.detail, { size: "Small" }, 800));
     if (olderUnconfirmed) details.push(block(`${olderUnconfirmed} earlier instruction(s) unconfirmed`, { size: "Small" }));
-    if (!list) navigation.push({ type: "Action.ShowCard", title: "More", card: card(details) });
+    if (!list) navigation.push(state.interaction
+      ? execute("All actions", { op: "all-actions", ...(target && target.kind !== "controller" ? { targetId: target.id } : {}) })
+      : { type: "Action.ShowCard", title: "More", card: card(details) });
     const result = card(body, navigation);
-    if (Buffer.byteLength(JSON.stringify(result)) > 27_000) {
+    const oversized = () => Buffer.byteLength(JSON.stringify(outboundActivity({ type: "card", card: result }))) > 27_000;
+    if (oversized()) {
       progress.items = [block("Recent progress omitted to fit Teams' card limit." +
         (target?.access?.read !== false ? " Read History for visible events." : ""), { size: "Small", isSubtle: true })];
     }
-    if (Buffer.byteLength(JSON.stringify(result)) > 27_000) {
-      for (const excerpt of excerpts) if (typeof excerpt.text === "string") excerpt.text = safeText(excerpt.text, 200);
+    for (const limit of [200, 80]) {
+      if (!oversized()) break;
+      for (const excerpt of excerpts) if (typeof excerpt.text === "string") excerpt.text = safeText(excerpt.text, limit);
     }
-    if (Buffer.byteLength(JSON.stringify(result)) > 27_000) {
+    if (oversized()) {
       return card([
         block(title, { weight: "Bolder" }),
         ...(status ? [block(status.text, { size: "Small" })] : []),

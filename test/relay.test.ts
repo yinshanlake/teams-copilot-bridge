@@ -469,7 +469,7 @@ test("v3 relay normal ACKs settle new cards without reposting uncertain Inbox or
       await handle("first exact task");
       failCard = "result";
       runtime.emit(id, "assistant.message", { messageId: "uncertain-result", content: "uncertain-result-body", phase: "final" });
-      runtime.emit(id, "session.task_complete", { success: true });
+      runtime.emit(id, "session.task_complete", { success: true, summary: "Generic completion, not the actual answer" });
       runtime.emit(id, "session.idle");
       await bridge.flush();
       const oldResult = store.snapshot().outbox.find((item) => item.eventId === "uncertain-result")!;
@@ -479,7 +479,7 @@ test("v3 relay normal ACKs settle new cards without reposting uncertain Inbox or
       assert.equal(failedRequests.length, 2);
       await handle("second exact task");
       runtime.emit(id, "assistant.message", { messageId: "acked-result", content: "acked-result-body", phase: "final" });
-      runtime.emit(id, "session.task_complete", { success: true });
+      runtime.emit(id, "session.task_complete", { success: true, summary: "Generic completion, not the actual answer" });
       runtime.emit(id, "session.idle");
       await bridge.flush();
       await bridge.flush();
@@ -494,6 +494,13 @@ test("v3 relay normal ACKs settle new cards without reposting uncertain Inbox or
       assert.equal(sends.filter((packet) => JSON.stringify(packet.payload.activity).includes("Copilot Sessions - Inbox")).length, 1);
       assert.equal(sends.filter((packet) => JSON.stringify(packet.payload.activity).includes("uncertain-result-body")).length, 1);
       assert.equal(sends.filter((packet) => JSON.stringify(packet.payload.activity).includes("acked-result-body")).length, 1);
+      const actual = sends.find((packet) => JSON.stringify(packet.payload.activity).includes("acked-result-body"))!.payload.activity;
+      assert.ok(object(actual) && Array.isArray(actual.attachments));
+      const attachment = actual.attachments[0];
+      assert.ok(object(attachment) && object(attachment.content) && Array.isArray(attachment.content.body));
+      assert.equal(attachment.content.body[0]?.text, "acked-result-body", "relay must put the actual answer first, without a generic summary prefix");
+      assert.equal(actual.text, undefined);
+      assert.equal(actual.textFormat, undefined);
       assert.equal(combinedFailures, 0);
     } finally { await bridge.close(); }
   }, { acknowledgementMs: 300 });

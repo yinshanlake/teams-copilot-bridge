@@ -93,7 +93,7 @@ function interaction(value: unknown): boolean {
     (route.sessionId === undefined || canonicalId(route.sessionId))))) return false;
   return Object.entries(value.surfaces).every(([id, item]) =>
     canonicalId(id) && object(item) && item.id === id && string(item.conversationKey) &&
-    ["inbox", "header", "turn", "request", "result", "digest", "routing", "stop"].includes(String(item.kind)) &&
+    ["inbox", "header", "turn", "request", "result", "digest", "routing", "stop", "actions", "picker"].includes(String(item.kind)) &&
     integer(item.revision, 1) && integer(item.version, 1) && typeof item.urgent === "boolean" &&
     ["pending", "sending", "ready", "uncertain", "rejected"].includes(String(item.delivery)) &&
     (item.sessionId === undefined || canonicalId(item.sessionId)) &&
@@ -101,6 +101,13 @@ function interaction(value: unknown): boolean {
     (item.renderedVersion === undefined || integer(item.renderedVersion)) &&
     (item.retryAt === undefined || integer(item.retryAt)) &&
     (item.page === undefined || integer(item.page)) &&
+    (item.notBefore === undefined || integer(item.notBefore)) &&
+    (item.suppressed === undefined || typeof item.suppressed === "boolean") &&
+    (item.query === undefined || typeof item.query === "string" && item.query.length <= 100) &&
+    (item.section === undefined || ["menu", "details", "settings", "control", "help", "request", "steer", "history"].includes(String(item.section))) &&
+    (item.modelKey === undefined || string(item.modelKey)) &&
+    (item.listView === undefined || ["sessions", "working", "needs-reply", "sides", "subscriptions"].includes(String(item.listView))) &&
+    (item.sideParentId === undefined || canonicalId(item.sideParentId)) &&
     (item.requestHash === undefined || typeof item.requestHash === "string" && /^[a-f0-9]{64}$/u.test(item.requestHash)) &&
     (item.stop === undefined || object(item.stop) && ["pending", "accepted", "cancelled", "uncertain"].includes(String(item.stop.state)) &&
       integer(item.stop.expiresAt) && (item.stop.messageId === undefined || string(item.stop.messageId, 512))) &&
@@ -116,6 +123,7 @@ function interaction(value: unknown): boolean {
     Object.entries(value.follows).every(([id, item]) => object(item) && item.id === id &&
       canonicalId(item.sessionId) && string(item.conversationKey) && id === digest(`${item.conversationKey}:${item.sessionId}`) &&
       integer(item.revision, 1) && ["automatic", "explicit", "muted"].includes(String(item.mode)) &&
+      (item.explicitMute === undefined || typeof item.explicitMute === "boolean") &&
       ["journal", "live", "unavailable"].includes(String(item.observation)) &&
       (item.expiresAt === undefined || integer(item.expiresAt)) && typeof item.detail === "string") &&
     Object.entries(value.active).every(([id, turn]) => canonicalId(id) && string(turn) && object(value.turns) &&
@@ -123,7 +131,7 @@ function interaction(value: unknown): boolean {
 }
 
 function isState(value: unknown, owner: string): value is BridgeState {
-  if (!object(value) || (value.schema !== 1 && value.schema !== 2 && value.schema !== 3 && value.schema !== 4) || value.owner !== owner || typeof value.actionKey !== "string" ||
+  if (!object(value) || typeof value.schema !== "number" || ![1, 2, 3, 4, 5].includes(value.schema) || value.owner !== owner || typeof value.actionKey !== "string" ||
     !/^[A-Za-z0-9_-]{43}$/.test(value.actionKey) || (value.controllerId !== undefined && !canonicalId(value.controllerId))) return false;
   if (!object(value.sessions) || !object(value.conversations) || !object(value.receipts) ||
     !Array.isArray(value.outbox) || !admissions(value.admissions) || !interaction(value.interaction)) return false;
@@ -229,11 +237,11 @@ export class Store {
         if ((await stat(statePath)).size > 64 * 1024 * 1024) throw new Error("Bridge state exceeds the 64 MiB startup budget; inspect/archive it manually.");
         const parsed: unknown = JSON.parse(await readFile(statePath, "utf8"));
         if (!isState(parsed, owner)) throw new Error("State schema/owner mismatch; refusing to replace state.");
-        state = { ...parsed, schema: 4, admissions: parsed.admissions ?? {}, subscriptions: parsed.subscriptions ?? {}, directOrigins: parsed.directOrigins ?? {} };
+        state = { ...parsed, schema: 5, admissions: parsed.admissions ?? {}, subscriptions: parsed.subscriptions ?? {}, directOrigins: parsed.directOrigins ?? {} };
       } catch (error) {
         if (!object(error) || error.code !== "ENOENT") throw error;
         state = {
-          schema: 4, owner, actionKey: randomBytes(32).toString("base64url"),
+          schema: 5, owner, actionKey: randomBytes(32).toString("base64url"),
           sessions: {}, conversations: {}, receipts: {}, outbox: [], admissions: {}, subscriptions: {}, directOrigins: {},
         };
       }

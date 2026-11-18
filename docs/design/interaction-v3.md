@@ -5,6 +5,22 @@
 The source analysis below is the historical Phase 0 baseline, not a claim that
 later implementation leaves configuration unchanged.
 
+The subsequent quiet-conversation implementation supersedes the earlier visible
+turn-card and automatic-unmute choices below. It uses a short truthful received/
+accepted/executing status with answer-first results; independent, searchable All
+actions and session-picker surfaces; shared host-derived session appearance;
+and explicit unsubscribe intent that survives tasks/restart. Schema 5 accepts
+validated 1-4 state and fences older writers. Legacy muted intent is not inferred:
+those entries remain muted until an explicit Subscribe. Earlier outbox identities,
+payload bytes, uncertainty and paused cursors remain intact. This is local
+implementation, not a claim of production deployment or native typing support.
+
+In the quiet UI, explicit Open (including a re-open) and `!use` select the
+source without reading or publishing history. They post one fresh Focus header
+with only locally known, bounded public excerpts. Recent conversation is a
+separate source-scoped, bounded view; a full history group is a distinct
+explicit request, not a side effect of selection.
+
 Phase 1 now ships the non-preview Focus path: independently scoped Inbox, turn,
 request and result cards; visible next-message target; read-only History/Show
 full; automatic/explicit following and Mute; origin-bound direct results; and

@@ -4,7 +4,7 @@ import { canonicalId, object, string, UserError } from "./safety.js";
 
 export const operations = ["view", "page", "filter", "select", "create", "send", "refresh", "stop", "pick-model", "settings", "answer", "subscribe", "unsubscribe",
   "show-full", "history-source", "inbox", "follow", "mute", "open-source", "route-send", "route-create", "route-refresh", "digest-page",
-  "confirm-stop", "cancel-stop", "steer"] as const;
+  "confirm-stop", "cancel-stop", "steer", "all-actions", "search-actions", "actions-page", "actions-section", "control-send", "read-source"] as const;
 export type Operation = typeof operations[number];
 
 export interface ActionScope {
@@ -13,6 +13,7 @@ export interface ActionScope {
   query?: string;
   targetId?: string;
   requestId?: string;
+  turnId?: string;
   argument?: string;
 }
 
@@ -42,7 +43,9 @@ function isView(value: unknown): value is View {
 }
 
 export function isViewNavigation(scope: ActionScope): boolean {
-  return (scope.op === "select" && canonicalId(scope.targetId)) ||
+  return ["all-actions", "search-actions", "actions-page"].includes(scope.op) ||
+    (scope.op === "actions-section" && ["menu", "details", "help", "control", "request", "steer", "history"].includes(scope.argument ?? "")) ||
+    (scope.op === "select" && canonicalId(scope.targetId)) ||
     (scope.op === "view" && ["home", "sessions", "working", "needs-reply", "subscriptions", "new", "control", "dashboard"].includes(scope.argument ?? "")) ||
     (scope.op === "view" && scope.argument === "sides" && canonicalId(scope.targetId)) ||
     (scope.op === "view" && scope.argument === "transcript" && canonicalId(scope.targetId)) ||
@@ -100,6 +103,7 @@ export class Actions {
       (claims.query !== undefined && !string(claims.query, 100)) ||
       (claims.targetId !== undefined && !string(claims.targetId)) ||
       (claims.requestId !== undefined && !string(claims.requestId)) ||
+      (claims.turnId !== undefined && !string(claims.turnId)) ||
       (claims.argument !== undefined && !string(claims.argument))) {
       throw new UserError("Invalid card action payload.");
     }
@@ -110,6 +114,7 @@ export class Actions {
       ...(claims.query === undefined ? {} : { query: claims.query }),
       ...(claims.targetId === undefined ? {} : { targetId: claims.targetId }),
       ...(claims.requestId === undefined ? {} : { requestId: claims.requestId }),
+      ...(claims.turnId === undefined ? {} : { turnId: claims.turnId }),
       ...(claims.argument === undefined ? {} : { argument: claims.argument }),
       ...(claims.surfaceId === undefined ? {} : { surfaceId: claims.surfaceId }),
     };
@@ -124,7 +129,7 @@ export class Actions {
     }
     // View-only links can recover legacy cards or navigate the current surface.
     // Runtime operations never bypass expiry or request/selection checks.
-    if (!isViewNavigation(claims)) {
+    if (!isViewNavigation(claims) || claims.version === 2 && claims.op === "select") {
       if (claims.expires <= now) throw new StaleCardActionError("This card expired.");
       if (claims.revision !== conversation.revision || claims.selected !== (conversation.selectedId ?? "")) {
         throw new StaleCardActionError("This card is stale or belongs to a different conversation/session.");

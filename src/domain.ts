@@ -255,12 +255,13 @@ export interface FollowPreference {
   sessionId: string;
   revision: number;
   mode: "automatic" | "explicit" | "muted";
+  explicitMute?: boolean;
   observation: "journal" | "live" | "unavailable";
   expiresAt?: number;
   detail: string;
 }
 
-export type InteractionSurfaceKind = "inbox" | "header" | "turn" | "request" | "result" | "digest" | "routing" | "stop";
+export type InteractionSurfaceKind = "inbox" | "header" | "turn" | "request" | "result" | "digest" | "routing" | "stop" | "actions" | "picker";
 
 export interface RoutingIntent {
   id: string;
@@ -300,6 +301,13 @@ export interface InteractionSurface {
   retryAt?: number;
   page?: number;
   requestHash?: string;
+  notBefore?: number;
+  suppressed?: boolean;
+  query?: string;
+  section?: "menu" | "details" | "settings" | "control" | "help" | "request" | "steer" | "history";
+  modelKey?: string;
+  listView?: SessionListView;
+  sideParentId?: string;
   stop?: { state: "pending" | "accepted" | "cancelled" | "uncertain"; expiresAt: number; messageId?: string };
 }
 
@@ -370,7 +378,7 @@ export interface DirectOrigin {
 }
 
 export interface BridgeState {
-  schema: 1 | 2 | 3 | 4;
+  schema: 1 | 2 | 3 | 4 | 5;
   owner: string;
   actionKey: string;
   controllerId?: string;

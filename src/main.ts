@@ -28,7 +28,7 @@ async function main(): Promise<void> {
       stateDirectory: config.stateDirectory, host: config.host, port: config.port,
       nativeAuth: config.native.auth, allowedWorkspaces: config.workspaces.length, nativePeers: config.native.peers,
       nativeStartup: "lazy", nativeModelConfigured: Boolean(config.native.defaultModel),
-      stateSchema: 4, interactionMode: "focus",
+      stateSchema: 5, interactionMode: "focus",
       remoteApprovals: config.interaction.remoteApprovals, approvalTimeoutMs: config.interaction.approvalTimeoutMs,
       appSessions: Boolean(config.native.appSessions), legacyCoordinatorIgnored,
       ...(config.transport === "relay" ? { relayOrigin: config.relay.relayUrl, relayBinding: config.relay.fingerprint, connected: false } : {}),

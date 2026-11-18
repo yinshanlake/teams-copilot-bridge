@@ -4,9 +4,9 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Activity } from "@microsoft/agents-activity";
-import type { BridgeState, InteractionSurface, SessionRecord } from "../src/domain.js";
+import type { BridgeState, Card, InteractionSurface, SessionRecord } from "../src/domain.js";
 import { interactionConfiguration } from "../src/config.js";
-import { interactionDefaults, interactionState, renderInteractionSurface } from "../src/interaction.js";
+import { acknowledgementDelayMs, interactionDefaults, interactionState, renderInteractionSurface } from "../src/interaction.js";
 import { mockEnvelope, mockIdentity } from "../src/simulator.js";
 import { authorizeActivity, outboundActivity } from "../src/teams.js";
 import { inputSuffix } from "../src/cards.js";
@@ -22,6 +22,596 @@ function surface(state: BridgeState, kind: InteractionSurface["kind"], sessionId
   assert.ok(found, `Missing ${kind} surface`);
   return found;
 }
+
+function delivered(h: Harness, id: string | undefined): Card {
+  assert.ok(id);
+  const message = h.transport.messages.get(id)?.message;
+  assert.ok(message?.type === "card");
+  return message.card;
+}
+
+function firstLayer(value: unknown): string {
+  if (Array.isArray(value)) return value.map(firstLayer).join("\n");
+  if (!object(value) || value.type === "Action.ShowCard" || value.isVisible === false) return "";
+  return [typeof value.text === "string" ? value.text : "",
+    ...Object.entries(value).filter(([key]) => !["data", "fallback"].includes(key)).map(([, item]) => firstLayer(item))].join("\n");
+}
+
+async function openActions(h: Harness, id?: string, query = ""): Promise<Card> {
+  const state = h.bridge.store.snapshot();
+  const origin = id
+    ? Object.values(state.interaction!.surfaces).findLast((item) =>
+      item.sessionId === id && !item.frozen && (item.kind === "header" || item.kind === "turn" || item.kind === "result"))
+    : surface(state, "inbox");
+  assert.ok(origin);
+  await h.action(findAction(renderInteractionSurface(state, origin, h.bridge.cards), "All actions"));
+  await h.bridge.flush();
+  const panel = surface(h.bridge.store.snapshot(), "actions", id);
+  if (query) {
+    await h.action(findAction(delivered(h, panel.activityId), "Search actions"), { actionQuery: query });
+    await h.bridge.flush();
+  }
+  return delivered(h, panel.activityId);
+}
+
+for (const style of ["submit", "execute"] as const) test(`compact Open: one fresh ${style} card, no implicit history, exact same-source and cross-view selection`, async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options, cardActions: style });
+  const a = await createWorking(h, "Harbor audit");
+  await h.text("fixture task");
+  h.runtime.emit(a, "assistant.message", { messageId: "harbor-result", content: "Published fixture reply.", phase: "final" });
+  h.runtime.emit(a, "session.task_complete", { success: true });
+  h.runtime.emit(a, "session.idle");
+  await h.bridge.flush();
+  const b = await createWorking(h, "Other source");
+  const rich = "\r\n| Name | Details |\r\n| -- | -- |\r\n| [Check](https://example.test/a) | `code` |\r\n".repeat(90);
+  await h.bridge.store.mutate((state) => {
+    state.sessions[a]!.timeline = [
+      { id: "old", kind: "assistant", phase: "final", text: `OLD-MESSAGE${rich}` },
+      { id: "q", kind: "user", text: `# Latest question, password=only-a-fixture ${"long ".repeat(100)}${rich}` },
+      { id: "a", kind: "assistant", phase: "final", text: `**Latest answer** ${"more ".repeat(100)}${rich}` },
+      { id: "hidden", kind: "assistant", phase: "commentary", text: "NOT-FOR-PREVIEW" },
+      { id: "tool", kind: "tool", text: "NOT-FOR-PREVIEW" },
+    ];
+    for (const [index, entry] of state.sessions[a]!.timeline.entries()) entry.timestamp = new Date(Date.now() + index + 1).toISOString();
+  });
+  await h.text("!sessions"); await h.bridge.flush();
+  const snap = () => h.bridge.store.snapshot();
+  const result = surface(snap(), "result", a);
+  const messages = h.runtime.received.slice();
+  const follows = snap().interaction!.follows;
+  const originalOutbox = snap().outbox;
+  const full = t.mock.method(h.runtime, "history");
+  const preview = t.mock.method(h.runtime, "preview");
+  const picker = surface(snap(), "picker");
+  const row = () => delivered(h, picker.activityId).body.find((entry) => entry.type === "ColumnSet" && firstLayer(entry).includes("Harbor audit"))!;
+  const checkOpen = async (click: () => Promise<unknown>) => {
+    await h.bridge.flush();
+    const previous = surface(snap(), "header");
+    const previousCount = h.transport.messages.size;
+    const peekCount = preview.mock.callCount();
+    await click(); await h.bridge.flush();
+    const state = snap();
+    const header = surface(state, "header", a);
+    assert.equal(state.conversations[h.key]!.selectedId, a);
+    assert.equal(h.transport.messages.size, previousCount + 1);
+    assert.equal([...h.transport.messages.keys()].at(-1), header.activityId);
+    assert.notEqual(header.id, previous.id);
+    assert.ok(state.interaction!.surfaces[previous.id]!.frozen);
+    assert.equal(state.conversations[h.key]!.historyRead, undefined);
+    assert.deepEqual(state.outbox, originalOutbox);
+    assert.deepEqual(state.interaction!.follows, follows);
+    assert.deepEqual(h.runtime.received, messages);
+    assert.equal(full.mock.callCount(), 0);
+    assert.equal(preview.mock.callCount(), peekCount, "Open uses only known dialogue");
+    const card = delivered(h, header.activityId);
+    assert.ok(card.body.some((block) => block.text === "● Ready" && block.color === "Good"));
+    for (const [label, limit] of [["You", 120], ["Copilot", 180]] as const) {
+      const offset = card.body.findIndex((entry) => entry.text === label);
+      assert.notEqual(offset, -1);
+      const excerpt = card.body[offset + 1]!;
+      assert.equal(excerpt.type, "TextBlock"); assert.equal(excerpt.maxLines, 2);
+      assert.ok(typeof excerpt.text === "string" && [...excerpt.text].length <= limit);
+    }
+    const text = firstLayer(card);
+    assert.match(text, /Latest question.*\[REDACTED\\?\]/s);
+    assert.match(text, /Latest answer/);
+    assert.doesNotMatch(text, /OLD-MESSAGE|NOT-FOR-PREVIEW|only-a-fixture|https:|HISTORY snapshot/);
+    for (const title of ["Unsubscribe", "Recent conversation", "Change next target", "All actions"]) assert.ok(findAction(card, title));
+    assert.ok(Buffer.byteLength(JSON.stringify(outboundActivity({ type: "card", card }))) <= 27_000);
+    return header;
+  };
+  const first = findAction(row(), "Open");
+  const staleRow = row().selectAction;
+  assert.ok(object(staleRow));
+  const activity = randomUUID();
+  const header = await checkOpen(() => h.action(first, {}, activity));
+  assert.equal(snap().receipts[digest(`${h.key}:${activity}`)]?.sessionId, a);
+  const n = h.transport.messages.size;
+  await h.action(first, {}, activity); await h.action(first); await h.bridge.flush();
+  assert.equal(surface(snap(), "header", a).id, header.id);
+  assert.equal(h.transport.messages.size, n, "both ingress and signed-nonce redelivery are once-only");
+  const gesture = row().selectAction;
+  assert.ok(object(gesture));
+  await checkOpen(() => h.action(gesture));
+  await checkOpen(() => h.action(findAction(delivered(h, result.activityId), "Open")));
+  const panel = await openActions(h, a, "Open session");
+  await checkOpen(() => h.action(findAction(panel, "Open session")));
+  await checkOpen(() => h.text("!use Harbor audit"));
+  const inbox = surface(snap(), "inbox");
+  await checkOpen(() => h.action(findAction(delivered(h, inbox.activityId), "Open")));
+  await h.text(`!use ${b}`); await h.bridge.flush();
+  await h.action(staleRow); await h.bridge.flush();
+  assert.equal(snap().conversations[h.key]!.selectedId, b, "a retained old row cannot select A again");
+  assert.equal(snap().conversations[h.key]!.selectionBlocked, false);
+  assert.deepEqual(h.runtime.received, messages);
+});
+
+test("compact Recent conversation stays on its signed source; full history is explicit, exact and survives a re-open", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const a = await createWorking(h, "Source A");
+  const latest = "A latest answer\n\n```ts\n" + "const value = ['a', 'b'];\r\n".repeat(400) + "```\r\nA-END";
+  await h.text("A latest question");
+  h.runtime.emit(a, "assistant.message", { messageId: "answer-a", content: latest, phase: "final" });
+  h.runtime.emit(a, "session.task_complete", { success: true });
+  h.runtime.emit(a, "session.idle"); await h.bridge.flush();
+  const turn = surface(h.bridge.store.snapshot(), "turn", a);
+  const historyButton = findAction(renderInteractionSurface(h.bridge.store.snapshot(), turn, h.bridge.cards), "History");
+  const b = await createWorking(h, "Keep B");
+  const count = h.runtime.received.length;
+  const read = t.mock.method(h.runtime, "history");
+  const previews = t.mock.method(h.runtime, "preview");
+  await h.action(historyButton); await h.bridge.flush();
+  const first = h.bridge.store.snapshot();
+  const panel = surface(first, "actions", a);
+  const recent = delivered(h, panel.activityId);
+  assert.equal(recent.body[0]?.text, "Recent conversation");
+  assert.equal(recent.body[1]?.text, "Source A");
+  assert.equal(first.conversations[h.key]!.selectedId, b);
+  assert.deepEqual(previews.mock.calls.map((call) => call.arguments[0]), [a]);
+  assert.equal(read.mock.callCount(), 0);
+  assert.ok(recent.body.filter((block) => block.text === "You" || block.text === "Copilot").length <= 2);
+  assert.match(firstLayer(recent), /You[\s\S]*A latest question[\s\S]*Copilot[\s\S]*A latest answer/);
+  assert.doesNotMatch(firstLayer(recent), /A-END|```|Keep B|fixture tool/);
+  assert.ok(recent.body.every((entry) => String(entry.text).length <= 260));
+  assert.equal(first.outbox.filter((item) => item.historyId).length, 0);
+  // Hold a real explicit A read while B is explicitly reopened. A's read-only intent must survive.
+  read.mock.restore();
+  const history = h.runtime.history.bind(h.runtime);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const requests = t.mock.method(h.runtime, "history", async (id: string) => { await held; return history(id); });
+  const full = findAction(recent, "Post full history");
+  try {
+    await h.action(full, { count: "1" });
+    await h.text(`!use ${b}`); // No hydration and no waiting for A's read.
+    assert.equal(h.bridge.store.snapshot().conversations[h.key]!.historyRead!.sessionId, a);
+  } finally { release(); }
+  await h.bridge.flush();
+  const after = h.bridge.store.snapshot();
+  assert.equal(after.conversations[h.key]!.selectedId, b);
+  const parts = after.outbox.filter((item) => item.historyId === after.conversations[h.key]!.historyRead!.id);
+  assert.ok(parts.length && parts.every((item) => item.sessionId === a && item.status === "sent"));
+  assert.ok(parts.map((part) => part.text).join("").endsWith(latest));
+  await h.action(full, { count: "10" }); await h.bridge.flush();
+  assert.equal(requests.mock.callCount(), 1);
+  assert.equal(h.runtime.received.length, count);
+  await h.text(`!use ${a}`);
+  await h.text("!history 2"); await h.bridge.flush();
+  const command = h.bridge.store.snapshot().conversations[h.key]!.historyRead!;
+  assert.equal(command.count, 2);
+  assert.ok(h.bridge.store.snapshot().outbox.filter((item) => item.historyId === command.id).map((part) => part.text).join("").endsWith(latest));
+});
+
+test("compact first-contact !use posts only a header; lost header ACK, restart and unreadable targets never replay or route work", async (t) => {
+  const dir = await temporary(t);
+  const h = await harness(t, false, dir, { interaction: options, initializeConversation: false });
+  const a = randomUUID(), b = randomUUID();
+  await h.bridge.store.mutate((state) => {
+    const sample = state.sessions[state.controllerId!]!;
+    state.sessions[a] = { ...sample, id: a, name: "Retained", kind: "saved", access: { read: true, send: false } };
+    state.sessions[b] = { ...sample, id: b, name: "No access", kind: "unavailable", access: { read: false, send: false } };
+  });
+  await h.text(`!use ${a}`); await h.bridge.flush();
+  assert.equal(h.transport.messages.size, 1);
+  assert.equal(delivered(h, surface(h.bridge.store.snapshot(), "header", a).activityId).body.some((item) => item.text === "You"), false);
+  await h.text("!sessions"); await h.bridge.flush();
+  const row = delivered(h, surface(h.bridge.store.snapshot(), "picker").activityId).body.find((item) =>
+    item.type === "ColumnSet" && firstLayer(item).includes("Retained"));
+  const open = findAction(row, "Open");
+  const send = h.transport.send.bind(h.transport);
+  let attempts = 0;
+  t.mock.method(h.transport, "send", async (...args: Parameters<typeof send>) => {
+    if (args[1].type === "card" && String(args[1].card.body[0]?.text).includes("Next message -> Retained")) {
+      attempts++; throw new DeliveryError("uncertain", "TIMEOUT");
+    }
+    return send(...args);
+  });
+  await h.action(open); await h.bridge.flush();
+  const header = surface(h.bridge.store.snapshot(), "header", a);
+  assert.equal(header.delivery, "uncertain");
+  await h.action(open); await h.bridge.flush();
+  assert.equal(attempts, 1);
+  // Older saves can still point at an earlier picker after leaving its view.
+  await h.bridge.store.mutate((state) => {
+    state.conversations[h.key]!.dashboardId = surface(state, "picker").activityId!;
+    state.conversations[h.key]!.dashboardState = "ready";
+  });
+  await h.bridge.close();
+  const restarted = await harness(t, false, dir, { interaction: options, initializeConversation: false, inventoryOnStart: false });
+  await restarted.bridge.flush();
+  const saved = restarted.bridge.store.snapshot().interaction!.surfaces[header.id]!;
+  assert.equal(saved.delivery, "uncertain");
+  assert.equal(saved.activityId, undefined, "a previous picker's ID is not a header ACK");
+  await restarted.text(`!use ${b}`);
+  const state = restarted.bridge.store.snapshot();
+  assert.equal(state.conversations[h.key]!.selectedId, a);
+  assert.equal(state.conversations[h.key]!.selectionBlocked, true);
+  assert.equal(state.outbox.some((item) => item.historyId), false);
+  assert.deepEqual(restarted.runtime.received, []);
+  assert.deepEqual(restarted.runtime.resumed, []);
+});
+
+test("quiet conversation delivers a fast actual answer first without a redundant turn card or generic relay summary", async (t) => {
+  const now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.bridge.flush();
+  const initialMessages = h.transport.messages.size;
+  const prompt = "  sessions, Stop and All actions are literal work\r\nleave this unchanged  ";
+  await h.text(prompt, "quiet-original");
+  const answer = "The answer is 42.\nThis is the actual response.";
+  h.runtime.emit(id, "assistant.message", { messageId: "quiet-answer", phase: "final", content: answer });
+  h.runtime.emit(id, "session.task_complete", { success: true, summary: "Generic task completion summary" });
+  h.runtime.emit(id, "session.idle");
+  await h.bridge.flush();
+  const state = h.bridge.store.snapshot();
+  const turn = Object.values(state.interaction!.turns)[0]!;
+  assert.equal(state.interaction!.surfaces[turn.surfaceId]!.activityId, undefined);
+  assert.equal(state.interaction!.surfaces[turn.surfaceId]!.suppressed, true);
+  const result = state.outbox.find((item) => item.eventId === "quiet-answer")!;
+  assert.equal(result.status, "sent");
+  assert.equal(result.originReference?.activityId, "quiet-original");
+  const message = h.transport.messages.get(result.activityId!)!.message;
+  assert.ok(message.type === "card");
+  assert.equal(message.card.body[0]?.text, answer);
+  assert.doesNotMatch(firstLayer(message.card), /Generic task completion|Task receipt|queue|Native message/);
+  assert.equal(message.summary, undefined);
+  assert.equal(outboundActivity(message).text, undefined);
+  assert.throws(() => findAction(message.card, "Show full"), /not found/);
+  assert.equal(h.transport.messages.size, initialMessages + 1);
+  assert.deepEqual(h.runtime.received, [{ sessionId: id, text: prompt }]);
+});
+
+test("quiet received hint precedes liveness, connection and native ACK; one status activity advances only on evidence", { timeout: 15_000 }, async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.bridge.flush();
+  const peer = randomUUID();
+  await h.bridge.store.mutate((state) => {
+    state.sessions[peer] = { ...state.sessions[id]!, id: peer, kind: "peer", peerSource: "app", status: "offline",
+      access: { read: true, send: false } };
+  });
+  let releaseLiveness!: () => void;
+  let releaseConnection!: () => void;
+  let releaseAck!: () => void;
+  const liveness = new Promise<void>((resolve) => { releaseLiveness = resolve; });
+  const connection = new Promise<void>((resolve) => { releaseConnection = resolve; });
+  const ack = new Promise<void>((resolve) => { releaseAck = resolve; });
+  t.mock.method(h.runtime, "appLiveness", async () => { await liveness; return []; });
+  const resume = h.runtime.resume.bind(h.runtime);
+  let connecting = false;
+  t.mock.method(h.runtime, "resume", async (...args: Parameters<typeof resume>) => {
+    connecting = true; await connection; return resume(...args);
+  });
+  let sending = false;
+  const nativeId = randomUUID();
+  const send = t.mock.method(h.runtime, "send", async () => {
+    sending = true; await ack; return { id: nativeId, peer: false };
+  });
+  const received = h.text("delayed task", "delayed-original");
+  try {
+    await eventually(() => Boolean(Object.values(h.bridge.store.snapshot().interaction!.turns).length));
+    now += acknowledgementDelayMs + 1;
+    await h.bridge.flush();
+    const turn = Object.values(h.bridge.store.snapshot().interaction!.turns)[0]!;
+    const status = h.bridge.store.snapshot().interaction!.surfaces[turn.surfaceId]!;
+    assert.ok(status.activityId);
+    assert.match(firstLayer(delivered(h, status.activityId)), /Received by bridge - not yet accepted/);
+    assert.equal(send.mock.callCount(), 0);
+    releaseLiveness();
+    await eventually(() => connecting);
+    await h.bridge.flush();
+    assert.match(firstLayer(delivered(h, status.activityId)), /Received by bridge - not yet accepted/);
+    releaseConnection();
+    await eventually(() => sending);
+    await h.bridge.flush();
+    assert.match(firstLayer(delivered(h, status.activityId)), /Received by bridge - not yet accepted/);
+    releaseAck();
+    await received;
+    await h.bridge.flush();
+    assert.match(firstLayer(delivered(h, status.activityId)), /Accepted by source - queued; execution not yet observed/);
+    h.runtime.emit(id, "user.message", { messageId: nativeId, content: "delayed task" });
+    h.runtime.emit(id, "assistant.turn_start", { turnId: "observed-root" });
+    await h.bridge.flush();
+    assert.match(firstLayer(delivered(h, status.activityId)), /Running - execution observed/);
+    const current = h.bridge.store.snapshot().interaction!.surfaces[turn.surfaceId]!;
+    assert.equal(current.activityId, status.activityId);
+    assert.equal(delivered(h, status.activityId).body.length, 1);
+    h.runtime.emit(id, "assistant.message", { originatingMessageId: nativeId, messageId: "delayed-result", content: "Done with the actual task." });
+    h.runtime.emit(id, "session.task_complete", { success: true });
+    await h.bridge.flush();
+    const result = h.bridge.store.snapshot().outbox.find((item) => item.eventId === "delayed-result")!;
+    assert.notEqual(result.activityId, status.activityId);
+    assert.equal(delivered(h, result.activityId).body[0]?.text, "Done with the actual task.");
+    assert.equal(h.bridge.store.snapshot().interaction!.surfaces[turn.surfaceId]!.activityId, status.activityId);
+    assert.match(firstLayer(delivered(h, status.activityId)), /Reply delivered/);
+  } finally { releaseLiveness(); releaseConnection(); releaseAck(); await received; }
+});
+
+test("quiet first contact discovers sessions/help without sending or waking a native session", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options, initializeConversation: false });
+  const card = await h.text("hello from Teams");
+  await h.bridge.flush();
+  assert.match(firstLayer(card), /Choose a session/);
+  const home = delivered(h, surface(h.bridge.store.snapshot(), "inbox").activityId);
+  assert.match(firstLayer(home), /!sessions.*!help/);
+  assert.ok(findAction(home, "Choose a session"));
+  await h.action(findAction(home, "All actions"));
+  await h.bridge.flush();
+  let panel = delivered(h, surface(h.bridge.store.snapshot(), "actions").activityId);
+  await h.action(findAction(panel, "Search actions"), { actionQuery: "help" });
+  await h.bridge.flush();
+  panel = delivered(h, surface(h.bridge.store.snapshot(), "actions").activityId);
+  await h.action(findAction(panel, "Commands and help"));
+  await h.bridge.flush();
+  assert.match(firstLayer(delivered(h, surface(h.bridge.store.snapshot(), "actions").activityId)), /Ordinary Teams composer text.*unchanged/);
+  assert.deepEqual(h.runtime.received, []);
+  assert.deepEqual(h.runtime.resumed, []);
+  assert.equal(h.runtime.live.size, 0);
+});
+
+test("quiet one-tap row subscriptions are source scoped, sticky across tasks/restart, and never select or send work", async (t) => {
+  const directory = await temporary(t);
+  const h = await harness(t, false, directory, { interaction: options });
+  const a = await createWorking(h, "Notification A");
+  const b = await createWorking(h, "Keep selected B");
+  await h.text("!sessions");
+  await h.bridge.flush();
+  const picker = surface(h.bridge.store.snapshot(), "picker");
+  const row = delivered(h, picker.activityId).body.find((entry) => entry.type === "ColumnSet" && firstLayer(entry).includes("Notification A"));
+  assert.ok(row);
+  const subscribe = findAction(row, "Subscribe");
+  await h.action(subscribe);
+  await h.bridge.flush();
+  const preferenceId = digest(`${h.key}:${a}`);
+  assert.equal(h.bridge.store.snapshot().interaction!.follows[preferenceId]!.mode, "explicit");
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b);
+  assert.deepEqual(h.runtime.received, []);
+  const updatedRow = delivered(h, picker.activityId).body.find((entry) => entry.type === "ColumnSet" && firstLayer(entry).includes("Notification A"));
+  await h.action(findAction(updatedRow, "Unsubscribe"));
+  await h.bridge.flush();
+  const muted = h.bridge.store.snapshot().interaction!.follows[preferenceId]!;
+  assert.equal(muted.explicitMute, true);
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b);
+  await h.text(`!use ${a}`);
+  await h.text("direct task still allowed");
+  assert.deepEqual(h.bridge.store.snapshot().interaction!.follows[preferenceId], muted);
+  await h.bridge.close();
+  const reopened = await harness(t, false, directory, { interaction: options, initializeConversation: false, inventoryOnStart: false });
+  await reopened.text("another task after restart");
+  assert.deepEqual(reopened.bridge.store.snapshot().interaction!.follows[preferenceId], muted);
+  reopened.runtime.emit(a, "assistant.message", { messageId: "muted-direct", content: "Direct reply survives mute." });
+  await reopened.bridge.flush();
+  assert.equal(reopened.bridge.store.snapshot().outbox.find((item) => item.eventId === "muted-direct")?.status, "sent");
+});
+
+test("quiet automatic expiry can renew, but legacy muted intent is never guessed or silently resubscribed", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const a = await createWorking(h);
+  await h.text("automatic");
+  const id = digest(`${h.key}:${a}`);
+  await h.bridge.store.mutate((state) => { state.interaction!.follows[id]!.expiresAt = Date.now() - 1; });
+  await h.bridge.checkSubscriptions();
+  assert.equal(h.bridge.store.snapshot().interaction!.follows[id]!.explicitMute, false);
+  await h.text("new work renews an automatic expiry");
+  assert.equal(h.bridge.store.snapshot().interaction!.follows[id]!.mode, "automatic");
+  await h.bridge.store.mutate((state) => {
+    state.interaction!.follows[id]!.mode = "muted";
+    delete state.interaction!.follows[id]!.explicitMute;
+  });
+  const legacy = h.bridge.store.snapshot().interaction!.follows[id]!;
+  await h.text("do not infer the old mute's intent");
+  assert.deepEqual(h.bridge.store.snapshot().interaction!.follows[id], legacy);
+});
+
+test("quiet picker, Focus and Inbox share host-derived status and update their existing activities across views", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = randomUUID();
+  h.runtime.foreign.push({ id, name: "Host-derived peer", kind: "peer", peerSource: "app", status: "idle",
+    workspace: h.directory, capability: "Live endpoint", access: { read: true, send: true }, liveUntil: Date.now() + 60_000 });
+  await h.text("!sessions");
+  await eventually(() => Boolean(h.bridge.store.snapshot().sessions[id]));
+  await h.bridge.flush();
+  const picker = surface(h.bridge.store.snapshot(), "picker");
+  const row = delivered(h, picker.activityId).body.find((item) => item.type === "ColumnSet" && firstLayer(item).includes("Host-derived peer"));
+  await h.action(findAction(row, "Open"));
+  await h.bridge.flush();
+  const header = surface(h.bridge.store.snapshot(), "header", id);
+  const inbox = surface(h.bridge.store.snapshot(), "inbox");
+  const appearance = (card: Card) => {
+    const values: Array<{ text: string; color: unknown }> = [];
+    const visit = (value: unknown) => {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (object(value) && value.type !== "Action.ShowCard") {
+        if (typeof value.text === "string" && /^[●○▲?!] /u.test(value.text)) values.push({ text: value.text, color: value.color });
+        for (const [key, item] of Object.entries(value)) if (key !== "data") visit(item);
+      }
+    };
+    visit(card);
+    return values;
+  };
+  for (const activityId of [picker.activityId, header.activityId, inbox.activityId]) {
+    assert.ok(appearance(delivered(h, activityId)).some((status) => status.text === "● Ready" && status.color === "Good"));
+  }
+  h.runtime.foreign[0]!.status = "busy";
+  await h.text("!home");
+  await eventually(() => h.bridge.store.snapshot().sessions[id]!.status === "busy");
+  await h.bridge.flush();
+  const currentInbox = surface(h.bridge.store.snapshot(), "inbox");
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.view, "home");
+  for (const activityId of [picker.activityId, header.activityId, currentInbox.activityId]) {
+    assert.ok(appearance(delivered(h, activityId)).some((status) => status.text === "● Working" && status.color === "Accent"));
+  }
+  assert.equal(h.bridge.store.snapshot().sessions[id]!.pending.length, 0);
+  assert.deepEqual(h.runtime.received, []);
+  assert.deepEqual(h.runtime.resumed, []);
+});
+
+for (const style of ["submit", "execute"] as const) test(`quiet searchable All actions executes scoped Steer/Stop/settings/Control and stays in the ${style} budget`, async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options, cardActions: style });
+  const a = await createWorking(h, "Actions source");
+  await h.text("original task");
+  const b = await createWorking(h, "Keep B selected");
+  let menu = await openActions(h, a);
+  assert.ok(findAction(menu, "Steer"));
+  assert.ok(findAction(menu, "Stop"));
+  const panelId = surface(h.bridge.store.snapshot(), "actions", a).id;
+  const panel = () => delivered(h, h.bridge.store.snapshot().interaction!.surfaces[panelId]!.activityId);
+  assert.ok(Buffer.byteLength(JSON.stringify(outboundActivity({ type: "card", card: menu }))) <= 27_000);
+  await h.action(findAction(menu, "Steer"));
+  await h.bridge.flush();
+  const steering = "  exact steering\r\nfor the original A task  ";
+  await h.action(findAction(panel(), "Send steering"), { steering });
+  await h.bridge.flush();
+  assert.deepEqual(h.runtime.received.at(-1), { sessionId: a, text: steering });
+  assert.equal(h.runtime.sendModes.at(-1)?.mode, "immediate");
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b);
+  await h.action(findAction(panel(), "All actions"));
+  await h.bridge.flush();
+  await h.action(findAction(panel(), "Stop"));
+  await h.bridge.flush();
+  assert.deepEqual(h.runtime.stopped, []);
+  await h.action(findAction(delivered(h, surface(h.bridge.store.snapshot(), "stop", a).activityId), "Confirm Stop"));
+  await h.bridge.flush();
+  assert.deepEqual(h.runtime.stopped, [a]);
+  await h.action(findAction(panel(), "Search actions"), { actionQuery: "model" });
+  await h.bridge.flush();
+  await h.action(findAction(panel(), "Model and mode"));
+  await h.bridge.flush();
+  await h.action(findAction(panel(), "Load options"), { modelKey: "mock-deep", mode: "interactive", effort: "__default__" });
+  await h.bridge.flush();
+  await h.action(findAction(panel(), "Apply"), { modelKey: "mock-deep", mode: "plan", effort: "max" });
+  await h.bridge.flush();
+  assert.deepEqual(h.runtime.settingsCalls.at(-1), { id: a, change: { modelKey: "mock-deep", mode: "plan", effort: "max" } });
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b);
+  await h.action(findAction(panel(), "All actions"));
+  await h.bridge.flush();
+  await h.action(findAction(panel(), "Search actions"), { actionQuery: "Control" });
+  await h.bridge.flush();
+  await h.action(findAction(panel(), "Control"));
+  await h.bridge.flush();
+  const control = findAction(panel(), "Send Control instruction");
+  await h.action(control, { instruction: "list only, explicitly requested management" });
+  await h.action(control, { instruction: "must not replay with changed input" });
+  assert.equal(h.runtime.received.filter((item) => item.sessionId === h.bridge.store.snapshot().controllerId).length, 1);
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b);
+  assert.ok(Buffer.byteLength(JSON.stringify(outboundActivity({ type: "card", card: panel() }))) <= 27_000);
+});
+
+test("quiet All actions reaches exact native requests and keeps other sources' approvals intact", async (t) => {
+  const h = await harness(t, true, undefined, { interaction: options });
+  const a = await createWorking(h, "Approval A");
+  await h.text("permission");
+  await eventually(() => Boolean(h.bridge.store.snapshot().sessions[a]!.pending.length));
+  const aRequest = h.bridge.store.snapshot().sessions[a]!.pending[0]!.id;
+  const b = await createWorking(h, "Question B");
+  await h.text("ask");
+  await eventually(() => Boolean(h.bridge.store.snapshot().sessions[b]!.pending.length));
+  const unrelated = surface(h.bridge.store.snapshot(), "request", b);
+  const menu = await openActions(h, a, "Review approval");
+  await h.action(findAction(menu, "Review approval"));
+  await h.bridge.flush();
+  const panel = surface(h.bridge.store.snapshot(), "actions", a);
+  const allow = findAction(delivered(h, panel.activityId), "Allow once");
+  await h.action(allow);
+  await h.bridge.flush();
+  assert.deepEqual(h.runtime.answers[0], { id: a, requestId: aRequest, answer: { approve: true, permission: "once" } });
+  assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b);
+  assert.equal(h.bridge.store.snapshot().interaction!.surfaces[unrelated.id]!.revision, unrelated.revision);
+  await h.action(allow);
+  assert.equal(h.runtime.answers.length, 1);
+});
+
+test("quiet Steer opener cannot silently retarget a retained task-A button to a later task B", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = await createWorking(h);
+  await h.text("task A");
+  const old = findAction(await openActions(h, id), "Steer");
+  const a = h.bridge.store.snapshot().interaction!.active[id]!;
+  h.runtime.emit(id, "session.task_complete", { success: true });
+  h.runtime.emit(id, "session.idle");
+  await h.text("task B");
+  await h.bridge.flush();
+  const b = h.bridge.store.snapshot().interaction!.active[id]!;
+  assert.notEqual(a, b);
+  assert.equal(h.bridge.store.snapshot().interaction!.turns[b]!.state, "executing");
+  const count = h.runtime.received.length;
+  await h.action(old);
+  await h.bridge.flush();
+  const state = h.bridge.store.snapshot();
+  assert.equal(h.runtime.received.length, count);
+  assert.notEqual(surface(state, "actions", id).section, "steer");
+  assert.throws(() => findAction(delivered(h, surface(state, "actions", id).activityId), "Send steering"), /not found/);
+  assert.match(state.conversations[h.key]!.notice, /originally offered processing request ended or changed/);
+});
+
+for (const style of ["submit", "execute"] as const) test(`quiet picker retains three rows and subscription controls within signed ${style} wire budgets`, async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options, cardActions: style });
+  for (let index = 0; index < 3; index++) {
+    const id = await createWorking(h, `Budget ${index}`);
+    await h.bridge.store.mutate((state) => {
+      state.sessions[id]!.name = "\u{1f680}".repeat(98) + index;
+      state.sessions[id]!.timeline = [
+        { id: `q-${index}`, kind: "user", text: "\u{1f680}".repeat(700) },
+        { id: `a-${index}`, kind: "assistant", phase: "final", text: "\u{1f680}".repeat(700) },
+      ];
+    });
+  }
+  await h.text("!sessions");
+  await h.bridge.flush();
+  const picker = surface(h.bridge.store.snapshot(), "picker");
+  const card = delivered(h, picker.activityId);
+  const rows = card.body.filter((entry) => entry.type === "ColumnSet");
+  assert.equal(rows.length, 3);
+  for (const row of rows) {
+    assert.ok(findAction(row, "Subscribe"));
+    assert.ok(findAction(row, "Open"));
+  }
+  assert.ok(Buffer.byteLength(JSON.stringify(outboundActivity({ type: "card", card }))) <= 27_000);
+});
+
+test("quiet native-only Actions explain unavailable control instead of offering an App permission or settings mutation", async (t) => {
+  const h = await harness(t, false, undefined, { interaction: options });
+  const id = randomUUID();
+  h.runtime.foreign.push({ id, name: "Original App host", kind: "peer", peerSource: "app", status: "busy",
+    workspace: h.directory, capability: "Original host owns control", access: { read: true, send: true }, liveUntil: Date.now() + 60_000 });
+  await h.text("!sessions");
+  await eventually(() => Boolean(h.bridge.store.snapshot().sessions[id]));
+  await h.bridge.flush();
+  await h.action(findAction(delivered(h, surface(h.bridge.store.snapshot(), "picker").activityId), "Open"));
+  await h.bridge.flush();
+  const menu = await openActions(h, id, "model");
+  assert.match(firstLayer(menu), /Native-only.*original host/);
+  assert.throws(() => findAction(menu, "Model and mode"), /not found/);
+  assert.throws(() => findAction(menu, "Stop"), /not found/);
+  assert.throws(() => findAction(menu, "Allow once"), /not found/);
+  assert.deepEqual(h.runtime.received, []);
+  assert.deepEqual(h.runtime.resumed, []);
+  assert.deepEqual(h.runtime.settingsCalls, []);
+});
 
 test("v3 direct results retain their original recipient through mute and selection; Show full is exact, scoped and once-only", async (t) => {
   const h = await harness(t, false, undefined, { interaction: options });
@@ -44,7 +634,8 @@ test("v3 direct results retain their original recipient through mute and selecti
   assert.equal(item.originReference?.activityId, "teams-original-prompt");
   assert.equal(item.text, content);
   const resultCard = renderInteractionSurface(state, surface(state, "result", a), h.bridge.cards);
-  assert.ok(JSON.stringify(resultCard).length < content.length);
+  assert.ok(String(resultCard.body[0]?.text).length < content.length);
+  assert.ok(Buffer.byteLength(JSON.stringify(outboundActivity({ type: "card", card: resultCard }))) <= 27_000);
   const full = findAction(resultCard, "Show full");
   const received = h.runtime.received.length;
   await h.action(full);
@@ -150,7 +741,8 @@ for (const completion of [
   const request = surface(before, "request", b);
   assert.ok(header.activityId);
   assert.match(JSON.stringify(h.transport.messages.get(header.activityId)), /Needs reply/);
-  assert.ok(findAction(h.transport.messages.get(header.activityId), "Allow once"));
+  assert.ok(findAction(h.transport.messages.get(header.activityId), "All actions"));
+  assert.ok(findAction(h.transport.messages.get(request.activityId!), "Allow once"));
   const messages = h.transport.messages.size;
   const updates = t.mock.method(h.transport, "update", h.transport.update.bind(h.transport));
   h.runtime.emit(b, completion.type, completion.type === "abort" || completion.type === "session.shutdown"
@@ -168,7 +760,11 @@ for (const completion of [
   assert.ok(after.interaction!.surfaces[request.id]!.frozen);
   assert.deepEqual(after.interaction!.surfaces[unrelated.id], unrelated);
   assert.equal(h.runtime.answers.length, 0);
-  assert.equal(h.transport.messages.size, messages, "updates must not repost a new header");
+  assert.ok(h.transport.messages.size - messages <= 1, "only an undelivered task's compact safety status may be added");
+  if (h.transport.messages.size > messages) {
+    const turn = after.interaction!.turns[request.turnId!]!;
+    assert.ok(after.interaction!.surfaces[turn.surfaceId]!.activityId);
+  }
   assert.equal(updates.mock.calls.filter((call) => call.arguments[1] === header.activityId).length, 1);
 });
 
@@ -191,6 +787,8 @@ test("v3 read-only History does not select, while explicit Open still selects an
 });
 
 for (const kind of ["inbox", "header", "turn"] as const) test(`v3 picker entry from ${kind} posts below newer activity and keeps picker navigation in place`, async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const h = await harness(t, false, undefined, { interaction: options, cardActions: "submit" });
   const b = await createWorking(h, "Switch destination");
   await createWorking(h, "Other one");
@@ -210,7 +808,9 @@ for (const kind of ["inbox", "header", "turn"] as const) test(`v3 picker entry f
   const oldPicker = h.bridge.store.snapshot().conversations[h.key]!;
   const oldOpen = findAction(deliveredCard(oldPicker.dashboardId), "Open");
   await h.text("work after opening the old picker");
-  h.runtime.emit(a, "assistant.message", { messageId: "picker-result", content: "Visible newer result", phase: "final" });
+  now += acknowledgementDelayMs;
+  await h.bridge.flush();
+  h.runtime.emit(a, "assistant.message", { messageId: "picker-result", content: "Visible newer result ".repeat(300), phase: "final" });
   h.runtime.emit(a, "session.task_complete", { success: true });
   h.runtime.emit(a, "session.idle");
   await h.bridge.flush();
@@ -266,7 +866,7 @@ for (const kind of ["inbox", "header", "turn"] as const) test(`v3 picker entry f
   await h.action(oldOpen);
   await h.bridge.flush();
   assert.equal(h.bridge.store.snapshot().conversations[h.key]!.selectedId, b, "a replaced picker's Open cannot retarget work");
-  assert.match(h.bridge.store.snapshot().conversations[h.key]!.notice, /operation card was replaced/);
+  assert.match(h.bridge.store.snapshot().conversations[h.key]!.notice, /card was replaced/);
   assert.deepEqual(h.runtime.received, sends);
 });
 
@@ -303,15 +903,15 @@ test("v3 picker entry with an uncertain send is not replayed by duplicate clicks
   assert.deepEqual(h.runtime.received, []);
 });
 
-test("v3 automatic following overrides Mute on a new accepted send, expires without cancelling direct obligations, and explicit Follow has no expiry", async (t) => {
+test("v3 explicit unsubscribe survives later tasks, leaves direct replies enabled, and explicit subscribe has no expiry", async (t) => {
   const h = await harness(t, false, undefined, { interaction: options });
   const id = await createWorking(h);
   await h.text("first");
   await h.text("!unsubscribe");
   await h.text("second");
   const followId = digest(`${h.key}:${id}`);
-  assert.equal(h.bridge.store.snapshot().interaction!.follows[followId]!.mode, "automatic");
-  await h.bridge.store.mutate((state) => { state.interaction!.follows[followId]!.expiresAt = Date.now() - 1; });
+  assert.equal(h.bridge.store.snapshot().interaction!.follows[followId]!.mode, "muted");
+  assert.equal(h.bridge.store.snapshot().interaction!.follows[followId]!.explicitMute, true);
   await h.bridge.checkSubscriptions();
   assert.equal(h.bridge.store.snapshot().interaction!.follows[followId]!.mode, "muted");
   const origin = Object.values(h.bridge.store.snapshot().directOrigins).at(-1)!.messageId!;
@@ -361,6 +961,7 @@ test("v3 each card coalesces progress independently but state transitions update
   const h = await harness(t, false, undefined, { interaction: options });
   const id = await createWorking(h);
   await h.text("work");
+  now += acknowledgementDelayMs;
   await h.bridge.flush();
   let state = h.bridge.store.snapshot();
   const turn = surface(state, "turn", id);
@@ -488,22 +1089,25 @@ test("v3 schema migration preserves a populated legacy journal, sent bytes, unce
     detail: "Synthetic paused cursor", cursor: { generation: "fixture", offset: 0, index: 0, anchor: digest(""),
       eofRecord: false, requests: [], starts: [], outputs: [] },
   };
-  await writeFile(join(directory, "state.json"), JSON.stringify(legacy));
-  const migrated = await Store.open(directory, "test-owner");
-  const current = migrated.snapshot();
-  assert.equal(current.schema, 4);
-  assert.equal(Object.keys(current.sessions).length, 357);
-  assert.equal(Object.keys(current.conversations).length, 1);
-  assert.deepEqual(current.outbox, legacy.outbox);
-  assert.deepEqual(current.admissions, legacy.admissions);
-  assert.deepEqual(current.subscriptions, legacy.subscriptions);
-  assert.equal(Object.values(current.receipts).filter((entry) => entry.status === "uncertain").length, 2);
-  assert.equal(current.interaction, undefined, "migration must not invent running turns from historical admissions");
-  await migrated.mutate((state) => { interactionState(state); });
-  assert.equal(migrated.snapshot().interaction!.follows[subscriptionId]!.mode, "explicit");
-  assert.deepEqual(migrated.snapshot().subscriptions, legacy.subscriptions);
-  assert.deepEqual(migrated.snapshot().interaction!.turns, {});
-  await migrated.close();
+  for (const schema of [1, 2, 3, 4] as const) {
+    legacy.schema = schema;
+    await writeFile(join(directory, "state.json"), JSON.stringify(legacy));
+    const migrated = await Store.open(directory, "test-owner");
+    const current = migrated.snapshot();
+    assert.equal(current.schema, 5);
+    assert.equal(Object.keys(current.sessions).length, 357);
+    assert.equal(Object.keys(current.conversations).length, 1);
+    assert.deepEqual(current.outbox, legacy.outbox);
+    assert.deepEqual(current.admissions, legacy.admissions);
+    assert.deepEqual(current.subscriptions, legacy.subscriptions);
+    assert.equal(Object.values(current.receipts).filter((entry) => entry.status === "uncertain").length, 2);
+    assert.equal(current.interaction, undefined, "migration must not invent running turns from historical admissions");
+    await migrated.mutate((state) => { interactionState(state); });
+    assert.equal(migrated.snapshot().interaction!.follows[subscriptionId]!.mode, "explicit");
+    assert.deepEqual(migrated.snapshot().subscriptions, legacy.subscriptions);
+    assert.deepEqual(migrated.snapshot().interaction!.turns, {});
+    await migrated.close();
+  }
 });
 
 test("v3 an uncertain digest keeps every member uncertain through restart instead of individually reposting", async (t) => {
@@ -548,13 +1152,16 @@ test("v3 reposting the Inbox freezes its predecessor and App busy metadata canno
   await h.bridge.flush();
   const first = h.bridge.store.snapshot();
   const previous = surface(first, "inbox");
-  const oldAction = findAction(renderInteractionSurface(first, previous, h.bridge.cards), "All sessions");
+  const oldAction = findAction(renderInteractionSurface(first, previous, h.bridge.cards), "Choose a session");
   await h.text("!home");
   await h.bridge.flush();
   const current = h.bridge.store.snapshot();
   assert.equal(Object.values(current.interaction!.surfaces).filter((entry) => entry.kind === "inbox" && !entry.frozen).length, 1);
   assert.match(JSON.stringify(h.transport.messages.get(previous.activityId!)), /Updated below/);
-  assert.match(JSON.stringify(h.bridge.render(h.key)), /pending questions\/approvals are unknown/);
+  const actions = await openActions(h, undefined, "Details");
+  await h.action(findAction(actions, "Details"));
+  await h.bridge.flush();
+  assert.match(firstLayer(delivered(h, surface(h.bridge.store.snapshot(), "actions").activityId)), /pending questions and approvals are unknown/);
   assert.equal(Object.values(current.interaction!.surfaces).filter((entry) => entry.kind === "request").length, 0);
   await h.action(oldAction);
   assert.match(h.bridge.store.snapshot().conversations[h.key]!.notice, /replaced or resolved/);
@@ -748,7 +1355,12 @@ test("F2: a real cross-focus History read failure is delivered visibly for A whi
   const a = await createWorking(h, "A history source");
   await h.text("work A");
   const first = h.bridge.store.snapshot();
-  const read = findAction(renderInteractionSurface(first, surface(first, "turn", a), h.bridge.cards), "History");
+  t.mock.method(h.runtime, "preview", async () => { throw new Error("Synthetic bounded preview failure"); });
+  await h.action(findAction(renderInteractionSurface(first, surface(first, "turn", a), h.bridge.cards), "History"));
+  await h.bridge.flush();
+  const recent = delivered(h, surface(h.bridge.store.snapshot(), "actions", a).activityId);
+  assert.match(firstLayer(recent), /Preview refresh unavailable/);
+  const read = findAction(recent, "Post full history");
   const b = await createWorking(h, "B remains selected");
   const history = h.runtime.history.bind(h.runtime);
   let reads = 0;
@@ -756,7 +1368,7 @@ test("F2: a real cross-focus History read failure is delivered visibly for A whi
     if (id === a) { reads++; throw new Error("Synthetic read failure after actual source dispatch"); }
     return history(id);
   });
-  await h.action(read);
+  await h.action(read, { count: "10" });
   await h.bridge.flush();
   const state = h.bridge.store.snapshot();
   assert.equal(reads, 1);
@@ -929,8 +1541,8 @@ for (const decision of ["Confirm Stop", "Cancel"] as const) test(`v3 Stop notice
   const delivered = h.transport.messages.get(header.activityId);
   assert.ok(delivered?.message.type === "card");
   const text = delivered.message.card.body.flatMap((entry) => typeof entry.text === "string" ? [entry.text] : []).join("\n");
-  assert.match(text, /See the separate Stop card for this request's status/);
   assert.doesNotMatch(text, /Confirm Stop on its separate card|No stop has been sent yet/);
+  assert.ok(findAction(delivered.message.card, "All actions"));
 });
 
 test("v3 an old Stop confirmation cannot abort a different observed request and App sources never expose remote Stop", async (t) => {
@@ -962,7 +1574,9 @@ test("v3 Steer sends immediate unchanged text to the original owned source witho
   const turn = Object.values(state.interaction!.turns)[0]!;
   const b = await createWorking(h, "Current other focus");
   state = h.bridge.store.snapshot();
-  const steering = findAction(renderInteractionSurface(state, surface(state, "turn", a), h.bridge.cards), "Send steering");
+  await h.action(findAction(await openActions(h, a, "Steer"), "Steer"));
+  await h.bridge.flush();
+  const steering = findAction(delivered(h, surface(h.bridge.store.snapshot(), "actions", a).activityId), "Send steering");
   const text = "  steer this exact text\r\nwithout changing it  ";
   await h.action(steering, { steering: text });
   assert.deepEqual(h.runtime.received.at(-1), { sessionId: a, text });
@@ -1011,7 +1625,9 @@ for (const path of ["result", "steering"] as const) test(`R2-F1: real Control-or
     assert.equal(result.direct, true);
     assert.equal(result.publication?.taskReceiptId, receiptId);
   } else {
-    await h.action(findAction(renderInteractionSurface(state, surface(state, "turn", id), h.bridge.cards), "Send steering"),
+    await h.action(findAction(await openActions(h, id, "Steer"), "Steer"));
+    await h.bridge.flush();
+    await h.action(findAction(delivered(h, surface(h.bridge.store.snapshot(), "actions", id).activityId), "Send steering"),
       { steering: "Preserve the original Control task" });
     await h.bridge.flush();
     state = h.bridge.store.snapshot();

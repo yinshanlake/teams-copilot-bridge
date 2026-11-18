@@ -5,7 +5,7 @@ import { Actions, isViewNavigation, StaleCardActionError, type ActionClaims } fr
 import { Cards, inputSuffix, latestTranscriptPage, sessionListPage } from "./cards.js";
 import type {
   Answer, AppAdmission, AppAdmissionSeed, BridgeOptions, Card, ConversationPreview, ConversationRecord, ModelChoice, Receipt, Runtime, RuntimeEvent,
-  SessionListView, SessionRecord, Settings, BridgeState, Subscription, OutboxItem, IncomingAddress, Outbound, SendOptions,
+  SessionListView, SessionRecord, Settings, BridgeState, Subscription, OutboxItem, IncomingAddress, Outbound, SendOptions, InteractionSurface,
 } from "./domain.js";
 import { appAdmissionNotice, appSessionCapability, isSessionListView, viewTarget } from "./domain.js";
 import type { TimelineEntry } from "./domain.js";
@@ -19,7 +19,7 @@ import { outboundActivity } from "./teams.js";
 import { assertFields, canonicalId, DeliveryError, digest, logError, object, publicError, safeText, sessionName, string, UncertainOperationError, UserError } from "./safety.js";
 import {
   followDescription, follows, focusHeader, inbox, interactionState, newSurface, observeInteraction, renderInteractionSurface,
-  setTurnState, startTurn, surfaceConversation, touchSurface, turnForOrigin,
+  pickerSurface, refreshSessionSurfaces, setTurnState, startTurn, surfaceConversation, touchSurface, turnForOrigin, usePicker,
 } from "./interaction.js";
 
 export type Incoming = ({ kind: "text"; text: string } | { kind: "action"; data: Record<string, unknown> }) & { address?: IncomingAddress };
@@ -127,9 +127,24 @@ export class Bridge {
       }
       for (const conversation of Object.values(state.conversations)) {
         conversation.surfaceId = randomUUID();
+        if (this.options.interaction && isSessionListView(conversation.view) &&
+          conversation.view !== "working" && conversation.view !== "needs-reply") {
+          const activityId = conversation.dashboardId;
+          const delivery = conversation.dashboardState;
+          const existing = Object.values(state.interaction!.surfaces).some((item) =>
+            item.kind === "picker" && item.conversationKey === conversation.key && !item.frozen);
+          const picker = pickerSurface(state, conversation.key, conversation.view);
+          if (!existing) {
+            if (activityId && delivery === "ready") { picker.activityId = activityId; picker.delivery = "ready"; }
+            else if (delivery === "uncertain" || delivery === "rejected") picker.delivery = delivery;
+            usePicker(state, picker);
+          }
+        }
         if (this.options.interaction && conversation.selectedId && state.sessions[conversation.selectedId]) {
           const header = focusHeader(state, conversation.key, conversation.selectedId);
-          if (!header.activityId && conversation.view === "dashboard" && conversation.dashboardId && conversation.dashboardState === "ready") {
+          if (!header.activityId && header.delivery === "pending" && conversation.view === "dashboard" &&
+            conversation.dashboardId && conversation.dashboardState === "ready" &&
+            !Object.values(state.interaction!.surfaces).some((item) => item.activityId === conversation.dashboardId)) {
             header.activityId = conversation.dashboardId; header.delivery = "ready";
             delete conversation.dashboardId; delete conversation.dashboardState;
           }
@@ -178,6 +193,7 @@ export class Bridge {
       session.settings = actual;
       if (session.status === "offline") session.status = "idle";
       session.capability = session.kind === "controller" ? controlCapability : workingCapability;
+      refreshSessionSurfaces(state, id);
     });
   }
 
@@ -265,24 +281,39 @@ export class Bridge {
           if (!string(incoming.text, 64_000)) throw new UserError("Message is empty or too long; it was not forwarded.");
           const command = parseCommand(incoming.text);
           operationName = command?.name ?? "send";
+          if (!command && this.options.interaction && (!incoming.address || incoming.address.place === "top")) {
+            await this.store.mutate((state) => {
+              const conversation = state.conversations[key]!;
+              if (!conversation.selectionBlocked && conversation.selectedId && state.sessions[conversation.selectedId]) {
+                startTurn(state, key, conversation.selectedId, receiptId, reference);
+              }
+            });
+            this.schedule(key);
+          }
           if (command?.name !== "unsubscribe") livenessFailed = await this.ensureAppLiveness();
           if (!command && this.options.interaction && incoming.address && incoming.address.place !== "top") {
             await this.captureRoute(key, incoming.text, receiptId, reference);
           } else await this.text(key, incoming.text, [receiptId], command);
         }
         if (!["history", "routing"].includes(this.store.snapshot().receipts[receiptId]?.operation ?? "")) {
-          await this.receipt(receiptId, key, operationName, "accepted", "Operation accepted; task completion is reported separately.");
+          const opened = this.options.interaction && ["select", "open-source", "use"].includes(operationName);
+          await this.receipt(receiptId, key, operationName, "accepted", opened
+            ? "Session selected. No history was requested and no task was sent." : "Operation accepted; task completion is reported separately.");
           if (actionReceipt) await this.receipt(actionReceipt, key, operationName, "accepted", "Card action consumed.");
         }
       } catch (error) {
         logError("inbound-operation", error);
+        if (this.options.interaction) await this.store.mutate((state) => {
+          const turn = state.interaction?.turns[receiptId];
+          if (turn?.state === "admitting") setTurnState(state, turn, error instanceof UncertainOperationError ? "uncertain" : "failed");
+        });
         let cancelledHistory = false;
         if (incoming.kind === "text" && /^\s*!use(?:\s|$)/iu.test(incoming.text) ||
-          ["select", "route-send", "route-create"].includes(operationName) && !(error instanceof StaleCardActionError)) {
+          ["select", "open-source", "route-send", "route-create"].includes(operationName) && !(error instanceof StaleCardActionError)) {
           await this.store.mutate((state) => {
             state.conversations[key]!.selectionBlocked = true;
             state.conversations[key]!.revision++;
-            cancelledHistory = this.supersedeHistory(state, key);
+            if (!state.conversations[key]!.historyRead?.readOnlyTarget) cancelledHistory = this.supersedeHistory(state, key);
           });
         }
         const detail = publicError(error) + (cancelledHistory ? " The previous pending HISTORY snapshot was superseded." : "");
@@ -318,7 +349,12 @@ export class Bridge {
       return renderInteractionSurface(state, inbox(state, key), this.cards);
     }
     if (this.options.interaction && conversation?.view === "dashboard" && conversation.selectedId && state.sessions[conversation.selectedId]) {
-      return renderInteractionSurface(state, focusHeader(state, key, conversation.selectedId), this.cards);
+      return this.renderSurface(state, focusHeader(state, key, conversation.selectedId));
+    }
+    if (this.options.interaction && conversation && isSessionListView(conversation.view)) {
+      const picker = Object.values(state.interaction?.surfaces ?? {}).find((item) =>
+        item.kind === "picker" && item.conversationKey === key && !item.frozen);
+      if (picker) return this.renderSurface(state, picker);
     }
     const targetId = conversation ? viewTarget(state, conversation) : undefined;
     const rendered = this.cards.render(state, key, this.modelCatalogues.get(targetId ?? "") ?? [],
@@ -329,6 +365,17 @@ export class Bridge {
           : this.transport.connected === true ? "connected" : "ready",
       });
     return rendered;
+  }
+
+  private renderSurface(state: BridgeState, surface: InteractionSurface): Card {
+    if (surface.kind === "picker") {
+      const conversation = surfaceConversation(state, surface);
+      return this.cards.render({ ...state, conversations: { ...state.conversations, [conversation.key]: conversation } },
+        conversation.key, [], undefined, { previews: this.previews, previewFailures: this.previewFailures });
+    }
+    const id = surface.sessionId ?? "";
+    return renderInteractionSurface(state, surface, this.cards, Date.now(), this.modelCatalogues.get(id) ?? [],
+      { entries: this.previews.get(id)?.entries ?? [], unavailable: this.previewFailures.has(id) });
   }
 
   private actionConversation(state: BridgeState, key: string, claims: ActionClaims): ConversationRecord {
@@ -344,7 +391,11 @@ export class Bridge {
     const state = this.store.snapshot();
     const conversation = state.conversations[key];
     if (!conversation || !isSessionListView(conversation.view)) return;
-    await Promise.all(sessionListPage(state, conversation).sessions.map(async (session) => {
+    await this.loadPreviews(sessionListPage(state, conversation).sessions);
+  }
+
+  private async loadPreviews(sessions: SessionRecord[]): Promise<void> {
+    await Promise.all(sessions.map(async (session) => {
       if (session.access?.read === false || session.kind === "unavailable") return;
       let read = this.previewReads.get(session.id);
       if (!read) {
@@ -515,6 +566,7 @@ export class Bridge {
         if (endpoint) session.liveUntil = endpoint.liveUntil;
         else delete session.liveUntil;
         session.capability = failed ? livenessFailureNotice : appSessionCapability(readable, endpoint !== undefined);
+        refreshSessionSurfaces(state, id);
       }
     });
     this.appLivenessFailed = failed;
@@ -534,9 +586,16 @@ export class Bridge {
         ? `${detail} No action was performed. These controls are refreshed; review the current session before acting.`
         : detail, 800);
       if (refreshCard) {
-        delete conversation.dashboardId;
-        delete conversation.dashboardState;
-        conversation.surfaceId = randomUUID();
+        const picker = this.options.interaction && isSessionListView(conversation.view)
+          ? Object.values(state.interaction?.surfaces ?? {}).find((surface) =>
+            surface.kind === "picker" && surface.conversationKey === key && !surface.frozen) : undefined;
+        if (picker) {
+          picker.revision++; touchSurface(picker, true); usePicker(state, picker);
+        } else {
+          delete conversation.dashboardId;
+          delete conversation.dashboardState;
+          conversation.surfaceId = randomUUID();
+        }
       }
       const sessionId = history?.sessionId ?? conversation.selectedId ?? state.controllerId;
       if (!sessionId) throw new Error("Cannot report an operation without a controller.");
@@ -562,6 +621,22 @@ export class Bridge {
     this.schedule(key);
   }
 
+  private async openActions(key: string, sessionId?: string, section: InteractionSurface["section"] = "menu"): Promise<void> {
+    if (!this.options.interaction) throw new UserError("All actions requires the interaction UI.");
+    await this.store.mutate((state) => {
+      for (const previous of Object.values(interactionState(state).surfaces)) {
+        if (previous.kind === "actions" && previous.conversationKey === key && !previous.frozen) {
+          previous.frozen = "Replaced by the newer All actions panel.";
+          previous.revision++; touchSurface(previous, true);
+        }
+      }
+      const panel = newSurface(state, key, "actions", sessionId ? { sessionId } : {});
+      panel.section = section;
+      panel.requestHash = digest(JSON.stringify(state.sessions[sessionId ?? ""]?.pending ?? []));
+    });
+    this.schedule(key);
+  }
+
   private async showSessions(key: string, fresh: boolean, preservePage = false, view: SessionListView = "sessions"): Promise<void> {
     if (this.options.interaction && (view === "working" || view === "needs-reply")) {
       await this.showHome(key, fresh);
@@ -578,6 +653,7 @@ export class Bridge {
       await this.notice(key, notice);
       this.schedule(key);
     }
+    if (this.options.interaction) await this.store.mutate((state) => { pickerSurface(state, key, view, fresh); });
     this.startCatalogueRefresh();
   }
 
@@ -592,7 +668,11 @@ export class Bridge {
 
   private async showHome(key: string, fresh: boolean): Promise<void> {
     await this.setView(key, "home");
-    if (this.options.interaction) await this.store.mutate((state) => { touchSurface(inbox(state, key, fresh), true); });
+    if (this.options.interaction) await this.store.mutate((state) => {
+      const current = inbox(state, key, fresh);
+      delete current.suppressed;
+      touchSurface(current, true);
+    });
     if (fresh) await this.freshReply(key, "Choose a working session, or use Control.");
     this.startCatalogueRefresh();
   }
@@ -633,6 +713,10 @@ export class Bridge {
     }
     await this.store.mutate((state) => {
       const conversation = state.conversations[key]!;
+      if (this.options.interaction && !isSessionListView(view) && !["home", "dashboard"].includes(view) &&
+        state.interaction?.surfaces[conversation.surfaceId ?? ""]?.kind === "picker") {
+        delete conversation.dashboardId; delete conversation.dashboardState; conversation.surfaceId = randomUUID();
+      }
       const transcriptId = explicitTranscriptId ?? viewTarget(state, conversation);
       if (view === "transcript" && transcriptId) {
         if (!state.sessions[transcriptId]) throw new UserError("Target is not in the current session catalogue.");
@@ -659,9 +743,10 @@ export class Bridge {
   private async action(key: string, claims: ActionClaims, data: Record<string, unknown>, receiptIds: string[]): Promise<void> {
     const conversation = this.actionConversation(this.store.snapshot(), key, claims);
     const targetId = viewTarget(this.store.snapshot(), conversation);
+    const initiatingSurface = claims.version === 2 ? this.store.snapshot().interaction?.surfaces[claims.surfaceId ?? ""] : undefined;
     if (this.options.interaction && ["subscribe", "unsubscribe", "follow", "mute"].includes(claims.op)) {
       assertFields(data, ["token"]);
-      if (!canonicalId(claims.targetId) || claims.targetId !== targetId && conversation.view !== "subscriptions") {
+      if (!canonicalId(claims.targetId) || claims.targetId !== targetId && !isSessionListView(conversation.view)) {
         throw new UserError("Following target does not match this signed source.");
       }
       await this.changeFollow(key, claims.targetId,
@@ -673,6 +758,74 @@ export class Bridge {
       await this.store.mutate((state) => { state.conversations[key]!.sideParentId = claims.targetId!; });
     }
     switch (claims.op) {
+      case "all-actions": {
+        assertFields(data, ["token"]);
+        if (claims.targetId !== undefined && (!canonicalId(claims.targetId) || !this.store.snapshot().sessions[claims.targetId])) {
+          throw new UserError("This source is no longer available. Choose a session.");
+        }
+        await this.openActions(key, claims.targetId);
+        return;
+      }
+      case "search-actions":
+      case "actions-page":
+      case "actions-section": {
+        assertFields(data, claims.op === "search-actions" ? ["token", "actionQuery"] : ["token"]);
+        if (initiatingSurface?.kind !== "actions") throw new StaleCardActionError("Open All actions before using this control.");
+        const query = data.actionQuery ?? "";
+        if (claims.op === "search-actions" && (typeof query !== "string" || query.length > 100)) throw new UserError("Search actions using at most 100 characters.");
+        if (claims.op === "actions-page" && (!claims.argument || !/^\d{1,4}$/u.test(claims.argument))) throw new UserError("Invalid actions page.");
+        const section = claims.argument;
+        if (claims.op === "actions-section" && section !== "menu" && section !== "details" && section !== "settings" &&
+          section !== "control" && section !== "help" && section !== "request" && section !== "steer" && section !== "history") throw new UserError("Unknown actions section.");
+        if (claims.op === "actions-section" && section === "settings") {
+          if (!targetId || this.store.snapshot().sessions[targetId]?.kind !== "owned") throw new UserError("Model and mode belong to the original host for this source.");
+          await this.ensureLive(targetId);
+          this.modelCatalogues.set(targetId, await this.runtime.models(targetId));
+          await this.refreshSettings(targetId);
+        }
+        if (claims.op === "actions-section" && section === "history") await this.previewRecent(targetId);
+        await this.store.mutate((state) => {
+          const panel = state.interaction!.surfaces[initiatingSurface.id]!;
+          if (panel.frozen) throw new StaleCardActionError("This All actions panel was replaced.");
+          if (claims.op === "search-actions") { panel.query = String(query).trim(); panel.page = 0; panel.section = "menu"; }
+          else if (claims.op === "actions-page") panel.page = Number(claims.argument);
+          else {
+            panel.section = section as NonNullable<InteractionSurface["section"]>;
+            panel.page = 0; panel.query = "";
+            delete panel.modelKey; delete panel.requestId; delete panel.turnId;
+            if (section === "request") {
+              if (!claims.requestId || !targetId || !state.sessions[targetId]!.pending.some((entry) => entry.id === claims.requestId)) {
+                throw new StaleCardActionError("The exact native request is no longer pending.");
+              }
+              panel.requestId = claims.requestId;
+            }
+            if (section === "steer") {
+              const active = targetId ? state.interaction!.active[targetId] : undefined;
+              const offered = claims.turnId ? state.interaction!.turns[claims.turnId] : undefined;
+              if (!active || active !== claims.turnId || !offered || offered.finishedAt || offered.state !== "executing" ||
+                offered.conversationKey !== key || offered.sessionId !== targetId || !offered.messageId ||
+                !targetId || state.sessions[targetId]?.kind !== "owned" || state.sessions[targetId]!.status === "offline" ||
+                state.sessions[targetId]!.pending.length) {
+                throw new StaleCardActionError("The originally offered processing request ended or changed. No steering form was opened and nothing was sent.");
+              }
+              panel.turnId = active;
+            }
+          }
+          panel.revision++; touchSurface(panel, true);
+        });
+        return;
+      }
+      case "control-send":
+        assertFields(data, ["token", "instruction"]);
+        if (initiatingSurface?.kind !== "actions" || initiatingSurface.section !== "control") throw new StaleCardActionError("Open the explicit Control form first.");
+        if (!string(data.instruction, 64_000) || !data.instruction.trim()) throw new UserError("Enter a nonblank management instruction.");
+        await this.sendControl(key, data.instruction);
+        return;
+      case "read-source":
+        assertFields(data, ["token"]);
+        if (!canonicalId(claims.targetId)) throw new UserError("Choose a known source.");
+        await this.showTranscript(key, claims.targetId);
+        return;
       case "confirm-stop":
       case "cancel-stop": {
         assertFields(data, ["token"]);
@@ -773,12 +926,21 @@ export class Bridge {
       case "open-source":
         assertFields(data, ["token"]);
         if (!canonicalId(claims.targetId)) throw new UserError("Choose a canonical source.");
-        await this.requestHistory(key, claims.targetId, 10, receiptIds, true);
+        await this.openSession(key, claims.targetId, receiptIds, claims);
         return;
       case "history-source":
-        assertFields(data, ["token"]);
         if (!canonicalId(claims.targetId)) throw new UserError("Choose a canonical source.");
-        await this.requestHistory(key, claims.targetId, 10, receiptIds, false, true);
+        if (claims.argument === "publish") {
+          assertFields(data, ["token", "count"]);
+          if (initiatingSurface?.kind !== "actions" || initiatingSurface.section !== "history" ||
+            initiatingSurface.sessionId !== claims.targetId) throw new StaleCardActionError("Open Full history for this source first.");
+          if (typeof data.count !== "string" || !/^(?:[1-9]|[1-4]\d|50)$/u.test(data.count)) throw new UserError("Choose a history count from 1 to 50.");
+          await this.requestHistory(key, claims.targetId, Number(data.count), receiptIds, false, true);
+        } else {
+          assertFields(data, ["token"]);
+          await this.previewRecent(claims.targetId);
+          await this.openActions(key, claims.targetId, "history");
+        }
         return;
       case "show-full":
         assertFields(data, ["token"]);
@@ -843,6 +1005,7 @@ export class Bridge {
             if (!canonicalId(claims.targetId) || !this.store.snapshot().sessions[claims.targetId]) throw new UserError("A known parent ID is required.");
             await this.setView(key, view);
             await this.store.mutate((state) => { state.conversations[key]!.sideParentId = claims.targetId!; });
+            if (this.options.interaction) await this.store.mutate((state) => { pickerSurface(state, key, "sides", true); });
             this.startCatalogueRefresh();
             return;
           }
@@ -859,7 +1022,10 @@ export class Bridge {
           const id = claims.targetId ?? targetId;
           if (!id) throw new UserError("Choose a source with !sessions or !use before reading history.");
           if (id === this.store.snapshot().controllerId) await this.showTranscript(key, id);
-          else await this.requestHistory(key, id, 10, receiptIds, !this.options.interaction, Boolean(this.options.interaction));
+          else if (this.options.interaction) {
+            await this.previewRecent(id);
+            await this.openActions(key, id, "history");
+          } else await this.requestHistory(key, id, 10, receiptIds, true);
           return;
         }
         await this.setView(key, view);
@@ -870,6 +1036,14 @@ export class Bridge {
         if (!claims.argument || !/^\d{1,5}$/.test(claims.argument) ||
           (!isSessionListView(claims.view) && !(claims.view === "transcript" && canonicalId(claims.targetId)) &&
             !isSessionListView(conversation.view) && conversation.view !== "settings" && conversation.view !== "transcript")) throw new UserError("Invalid page.");
+        if (initiatingSurface?.kind === "picker" || initiatingSurface?.kind === "actions" && initiatingSurface.section === "settings") {
+          await this.store.mutate((state) => {
+            const surface = state.interaction!.surfaces[initiatingSurface.id]!;
+            surface.page = Number(claims.argument); surface.revision++; touchSurface(surface, true);
+            if (surface.kind === "picker") usePicker(state, surface);
+          });
+          return;
+        }
         if (isSessionListView(claims.view) && conversation.view !== claims.view) await this.setView(key, claims.view);
         if (claims.view === "sides" && canonicalId(claims.targetId)) await this.store.mutate((state) => { state.conversations[key]!.sideParentId = claims.targetId!; });
         if (claims.view === "transcript" && claims.targetId) await this.showTranscript(key, claims.targetId);
@@ -884,6 +1058,13 @@ export class Bridge {
         const queryInput = data.query ?? "";
         if (typeof queryInput !== "string" || queryInput.length > 100) throw new UserError("Enter a session name of at most 100 characters.");
         const query = queryInput.trim();
+        if (initiatingSurface?.kind === "picker") {
+          await this.store.mutate((state) => {
+            const surface = state.interaction!.surfaces[initiatingSurface.id]!;
+            surface.query = query; surface.page = 0; surface.revision++; touchSurface(surface, true); usePicker(state, surface);
+          });
+          return;
+        }
         await this.setView(key, isSessionListView(claims.view) ? claims.view : "sessions");
         await this.store.mutate((state) => {
           state.conversations[key]!.query = query;
@@ -894,6 +1075,9 @@ export class Bridge {
       case "refresh":
         assertFields(data, ["token"]);
         if (isSessionListView(claims.view)) {
+          if (initiatingSurface?.kind === "picker") await this.store.mutate((state) => {
+            usePicker(state, state.interaction!.surfaces[initiatingSurface.id]!);
+          });
           await this.showSessions(key, false, true, claims.view);
           return;
         }
@@ -917,7 +1101,7 @@ export class Bridge {
       case "select":
         assertFields(data, ["token"]);
         if (!canonicalId(claims.targetId)) throw new UserError("A full canonical session ID is required.");
-        await this.requestHistory(key, claims.targetId, 10, receiptIds, true);
+        await this.openSession(key, claims.targetId, receiptIds, claims);
         return;
       case "create":
         assertFields(data, ["token", "sessionName", "workspace"]);
@@ -947,7 +1131,10 @@ export class Bridge {
       case "stop":
         assertFields(data, ["token"]);
         if (!targetId || claims.targetId !== targetId) throw new UserError("Stop action does not match the current session.");
-        if (this.options.interaction) { await this.requestStop(key, targetId); return; }
+        if (this.options.interaction) {
+          if (claims.argument && this.store.snapshot().interaction?.active[targetId] !== claims.argument) throw new StaleCardActionError("The processing request changed. Open All actions again.");
+          await this.requestStop(key, targetId); return;
+        }
         await this.runtime.stop(targetId);
         await this.notice(key, "Stop request acknowledged. History and other sessions are preserved.");
         return;
@@ -960,8 +1147,13 @@ export class Bridge {
         this.modelCatalogues.set(targetId, models);
         const modelKey = data.modelKey;
         await this.store.mutate((state) => {
-          state.conversations[key]!.modelKey = modelKey;
-          state.conversations[key]!.revision++;
+          if (initiatingSurface?.kind === "actions") {
+            const panel = state.interaction!.surfaces[initiatingSurface.id]!;
+            panel.modelKey = modelKey; panel.revision++; touchSurface(panel, true);
+          } else {
+            state.conversations[key]!.modelKey = modelKey;
+            state.conversations[key]!.revision++;
+          }
         });
         await this.notice(key, "Model capabilities loaded. Nothing has been changed in the working session yet.");
         return;
@@ -984,6 +1176,7 @@ export class Bridge {
           state.sessions[targetId]!.settings = actual.actual;
           state.sessions[targetId]!.settingsReceipt = actual;
           state.conversations[key]!.revision++;
+          refreshSessionSurfaces(state, targetId);
         });
         await this.notice(key, `Settings ${actual.status}: ${actual.detail}`);
         return;
@@ -1050,15 +1243,19 @@ export class Bridge {
     if (command) {
       switch (command.name) {
         case "help":
+          if (this.options.interaction) {
+            await this.openActions(key, conversation.selectedId, "help");
+            return;
+          }
           await this.setView(key, conversation.selectedId ? "dashboard" : "home");
           await this.notice(key, "Native chat sends ordinary text unchanged. !sessions · !use <name or ID> · !history [1..50] · !status · !subscribe · !unsubscribe. Advanced: !new, !settings, !working, !needs-reply, !subscriptions.");
           return;
         case "use": {
-          await this.store.mutate((state) => {
+          let matches = this.resolveSource(command.target);
+          if (!this.options.interaction || matches.length !== 1) await this.store.mutate((state) => {
             state.conversations[key]!.selectionBlocked = true;
             state.conversations[key]!.revision++;
           });
-          let matches = this.resolveSource(command.target);
           if (!matches.length) {
             await this.refreshInventory();
             matches = this.resolveSource(command.target);
@@ -1069,7 +1266,7 @@ export class Bridge {
               : "No known source matches. Use !sessions, then !use <name or canonical ID>. Nothing was created or resumed.";
             throw new UserError(detail);
           }
-          await this.requestHistory(key, matches[0]!.id, 10, receiptIds, true);
+          await this.openSession(key, matches[0]!.id, receiptIds);
           return;
         }
         case "history":
@@ -1125,6 +1322,7 @@ export class Bridge {
           const parent = this.store.snapshot().sessions[conversation.selectedId]?.sideChat?.parentId ?? conversation.selectedId;
           await this.showSessions(key, true, false, "sides");
           await this.store.mutate((state) => { state.conversations[key]!.sideParentId = parent; });
+          if (this.options.interaction) await this.store.mutate((state) => { pickerSurface(state, key, "sides"); });
           return;
         }
         case "read":
@@ -1151,6 +1349,8 @@ export class Bridge {
       await this.promptSelection(key);
       return;
     }
+    const received = this.store.snapshot().interaction?.turns[receiptIds[0] ?? ""];
+    if (received && received.sessionId !== conversation.selectedId) throw new UserError("The destination changed after bridge receipt. Nothing was forwarded; choose the intended source.");
     await this.sendWorking(key, conversation.selectedId, text, receiptIds);
   }
 
@@ -1165,6 +1365,10 @@ export class Bridge {
   }
 
   private async promptSelection(key: string): Promise<void> {
+    if (this.options.interaction) {
+      await this.showHome(key, false);
+      return;
+    }
     await this.showSessions(key, true);
     await this.notice(key, "Choose a source with !sessions or !use <name or ID>. Nothing was forwarded, created or resumed.");
   }
@@ -1198,7 +1402,6 @@ export class Bridge {
       : target.capability);
     if (target.kind === "unavailable" || target.kind === "saved") throw new UserError(target.capability);
     if (target.pending.length) throw new UserError("This session is awaiting a scoped native response. Use its request card, not an ordinary message.");
-    await this.ensureLive(id);
     let acknowledge: (() => void) | undefined;
     let gate: Promise<void> | undefined;
     const originId = receiptIds[0]!;
@@ -1238,6 +1441,7 @@ export class Bridge {
     let result: Awaited<ReturnType<Runtime["send"]>>;
     let accepted = false;
     try {
+      await this.ensureLive(id);
       result = await this.runtime.send(id, text, target.peerSource === "app"
         ? (seed) => this.persistAppAdmission(key, id, receiptIds, seed) : undefined, delivery);
       accepted = true;
@@ -1315,12 +1519,30 @@ export class Bridge {
     return id;
   }
 
-  private async select(key: string, id: string): Promise<void> {
-    const target = this.store.snapshot().sessions[id];
-    if (!target || target.kind === "controller") throw new UserError("Target is not in the current working-session catalogue.");
-    await this.store.mutate((state) => {
-      this.supersedeHistory(state, key);
+  private async previewRecent(id: string | undefined): Promise<void> {
+    const source = this.store.snapshot().sessions[id ?? ""];
+    if (!source || source.kind === "unavailable" || source.access?.read === false) throw new UserError("This source has no readable conversation.");
+    await this.loadPreviews([source]);
+  }
+
+  private async openSession(key: string, id: string, receiptIds: string[], claims?: ActionClaims): Promise<void> {
+    if (!this.options.interaction) return this.requestHistory(key, id, 10, receiptIds, true);
+    await this.select(key, id, { receiptIds, ...(claims ? { claims } : {}) });
+    this.schedule(key);
+  }
+
+  private async select(key: string, id: string, open?: { receiptIds: string[]; claims?: ActionClaims }): Promise<void> {
+    const error = await this.store.mutate((state) => {
+      if (open?.claims) this.actions.requireCurrent(open.claims, this.actionConversation(state, key, open.claims));
+      const target = state.sessions[id];
       const conversation = state.conversations[key]!;
+      if (!canonicalId(id) || !target || target.kind === "controller" || open && (target.kind === "unavailable" || target.access?.read === false)) {
+        conversation.selectionBlocked = true; conversation.revision++;
+        if (!conversation.historyRead?.readOnlyTarget) this.supersedeHistory(state, key);
+        return "Cannot open that source. Selection was not changed; nothing was sent.";
+      }
+      const read = conversation.historyRead;
+      if (!this.options.interaction || read && !read.readOnlyTarget && read.sessionId !== id) this.supersedeHistory(state, key);
       conversation.selectedId = id;
       conversation.selectionBlocked = false;
       conversation.view = "dashboard";
@@ -1329,8 +1551,29 @@ export class Bridge {
       conversation.read[id] = state.sessions[id]!.sequence;
       delete conversation.modelKey;
       conversation.notice = "View switched. Other sessions were not stopped.";
-      if (this.options.interaction) touchSurface(focusHeader(state, key, id), true);
+      if (this.options.interaction) {
+        touchSurface(focusHeader(state, key, id, Boolean(open)), true);
+        if (open) {
+          for (const receiptId of open.receiptIds) {
+            const receipt = state.receipts[receiptId];
+            if (!receipt || receipt.conversationKey !== key) throw new Error("Missing session selection receipt.");
+            receipt.sessionId = id;
+          }
+          // The picker keeps its own activity; it is not the new header's delivery receipt.
+          delete conversation.dashboardId; delete conversation.dashboardState;
+          conversation.surfaceId = randomUUID();
+          const intro = inbox(state, key);
+          if (intro.delivery === "pending" && !intro.activityId) intro.suppressed = true;
+          for (const surface of Object.values(state.interaction!.surfaces)) {
+            if (surface.conversationKey === key && !surface.frozen && (surface.kind === "picker" || surface.id === open.claims?.surfaceId)) {
+              surface.revision++; touchSurface(surface, true);
+            }
+          }
+        }
+      }
+      return undefined;
     });
+    if (error) throw new UserError(error);
   }
 
   private async changeFollow(
@@ -1341,10 +1584,10 @@ export class Bridge {
     const id = digest(`${key}:${sessionId}`);
     const before = this.store.snapshot();
     const previous = before.interaction?.follows[id];
-    if (mode === "automatic" && previous?.mode === "explicit") return;
+    if (mode === "automatic" && (previous?.mode === "explicit" || previous?.mode === "muted" && previous.explicitMute !== false)) return;
     let cursor: Awaited<ReturnType<Runtime["subscriptionBaseline"]>> | undefined;
     let observation = previous?.observation ?? "unavailable";
-    let detail = "Muted. Explicit task replies and pending request cards are not cancelled.";
+    let detail = "Unsubscribed by you. New tasks will not enable notifications; direct task replies and pending request cards are not cancelled.";
     let failure: unknown;
     if (mode !== "muted") {
       const source = before.sessions[sessionId];
@@ -1379,10 +1622,10 @@ export class Bridge {
       if (claims) this.actions.requireCurrent(claims, this.actionConversation(state, key, claims));
       const ui = interactionState(state);
       const existing = ui.follows[id];
-      if (mode === "automatic" && existing?.mode === "explicit") return;
+      if (mode === "automatic" && (existing?.mode === "explicit" || existing?.mode === "muted" && existing.explicitMute !== false)) return;
       const revision = existing && existing.mode !== "muted" && mode !== "muted" ? existing.revision : (existing?.revision ?? 0) + 1;
       ui.follows[id] = {
-        id, conversationKey: key, sessionId, revision, mode, observation, detail,
+        id, conversationKey: key, sessionId, revision, mode, observation, detail, explicitMute: mode === "muted",
         ...(mode === "automatic" ? { expiresAt: Date.now() + options.followMs } : {}),
       };
       if (cursor) {
@@ -1410,9 +1653,11 @@ export class Bridge {
           item.status = "cancelled"; item.detail = "Muted before passive delivery.";
         }
       }
-      state.conversations[key]!.notice = followDescription(state, key, sessionId);
+      if (mode !== "automatic") state.conversations[key]!.notice = followDescription(state, key, sessionId);
       touchSurface(inbox(state, key), true);
-      for (const surface of Object.values(ui.surfaces)) if (surface.conversationKey === key && surface.sessionId === sessionId) {
+      for (const surface of Object.values(ui.surfaces)) if (surface.conversationKey === key &&
+        (surface.kind === "picker" || surface.sessionId === sessionId && ["header", "actions"].includes(surface.kind))) {
+        surface.revision++;
         touchSurface(surface, true);
       }
     });
@@ -1584,6 +1829,7 @@ export class Bridge {
         if (!current || current.revision !== prior.revision || current.mode !== "automatic" ||
           current.expiresAt === undefined || current.expiresAt > Date.now()) continue;
         current.mode = "muted"; current.revision++;
+        current.explicitMute = false;
         current.detail = "Automatic following expired. Explicit task replies remain enabled.";
         const subscription = state.subscriptions[prior.id];
         if (subscription) {
@@ -1595,6 +1841,7 @@ export class Bridge {
           item.status = "cancelled"; item.detail = current.detail;
         }
         touchSurface(inbox(state, prior.conversationKey), true);
+        refreshSessionSurfaces(state, prior.sessionId);
       }
     });
     for (const entry of expired) this.schedule(entry.conversationKey);
@@ -1642,6 +1889,11 @@ export class Bridge {
       ...Object.values(state.interaction?.surfaces ?? {}).flatMap((surface) =>
         surface.delivery === "ready" && surface.renderedVersion !== surface.version
           ? [Math.max(surface.retryAt ?? 0, (surface.lastUpdatedAt ?? 0) + this.options.interaction!.statusUpdateMs)] : []),
+      ...Object.values(state.interaction?.surfaces ?? {}).flatMap((surface) =>
+        surface.kind === "turn" && surface.delivery === "pending" && !surface.suppressed && !surface.frozen &&
+          surface.notBefore !== undefined && surface.notBefore > now ? [surface.notBefore] : []),
+      ...Object.values(state.sessions).flatMap((session) =>
+        session.peerSource === "app" && session.liveUntil !== undefined && session.liveUntil > now ? [session.liveUntil] : []),
       ...state.outbox.flatMap((item) => item.status === "pending" && item.publication && !item.direct && !item.admissionId && !item.digestId
         ? [(item.createdAt ?? now) + (this.options.interaction!.digestMs ?? 60_000)] : []),
     ];
@@ -1649,7 +1901,12 @@ export class Bridge {
     const next = times.reduce((earliest, time) => Math.min(earliest, time), Infinity);
     this.interactionTimer = setTimeout(() => {
       this.interactionTimer = undefined;
-      for (const key of Object.keys(this.store.snapshot().conversations)) this.schedule(key);
+      void this.store.mutate((draft) => {
+        for (const session of Object.values(draft.sessions)) if (session.peerSource === "app" &&
+          session.liveUntil !== undefined && session.liveUntil <= Date.now()) refreshSessionSurfaces(draft, session.id);
+      }).then(() => {
+        for (const key of Object.keys(this.store.snapshot().conversations)) this.schedule(key);
+      }).catch((error: unknown) => { this.eventFailure = true; logError("interaction-wake", error); });
     }, Math.max(10, Math.min(2_000_000_000, next - now)));
     this.interactionTimer.unref();
   }
@@ -1874,6 +2131,7 @@ export class Bridge {
             existing.capability = "App session is no longer in the local directory. Refresh after restoring the original profile; no wake, takeover or coordinator fallback is attempted.";
           } else existing.capability = "Native peer is no longer discoverable; no attach/resume fallback is attempted.";
         }
+        refreshSessionSurfaces(state, existing.id);
       }
     });
   }
@@ -1891,6 +2149,7 @@ export class Bridge {
           receipt.detail = "Native setting-change event received and effective values read back.";
         }
       }
+      refreshSessionSurfaces(state, id);
     });
   }
 
@@ -2239,7 +2498,7 @@ export class Bridge {
     if (!options) return;
     const state = this.store.snapshot();
     const surfaces = Object.values(state.interaction?.surfaces ?? {}).filter((surface) =>
-      surface.conversationKey === key && surface.renderedVersion !== surface.version &&
+      surface.conversationKey === key && !surface.suppressed && surface.renderedVersion !== surface.version &&
       (surface.delivery === "ready" || surface.delivery === "pending" && surface.kind !== "result" && surface.kind !== "digest") &&
       (!surface.frozen || surface.activityId));
     for (const surface of surfaces) {
@@ -2247,28 +2506,46 @@ export class Bridge {
         surface.activityId && !surface.urgent && Date.now() < (surface.lastUpdatedAt ?? 0) + options.statusUpdateMs) continue;
       const snapshot = this.store.snapshot();
       const current = snapshot.interaction?.surfaces[surface.id];
-      if (!current || current.delivery !== surface.delivery || current.renderedVersion === current.version) continue;
+      if (!current || current.suppressed || current.frozen && !current.activityId ||
+        current.delivery !== surface.delivery || current.renderedVersion === current.version) continue;
+      if (current.kind === "turn" && !current.activityId) {
+        const turn = snapshot.interaction?.turns[current.turnId ?? ""];
+        const replies = snapshot.outbox.filter((item) => item.publication?.taskReceiptId === turn?.id);
+        if (replies.some((item) => item.status === "sent")) {
+          await this.store.mutate((draft) => { draft.interaction!.surfaces[current.id]!.suppressed = true; });
+          continue;
+        }
+        const danger = turn && ["failed", "uncertain", "stopped"].includes(turn.state) ||
+          replies.some((item) => item.status === "uncertain" || item.status === "rejected");
+        if (!danger && (current.notBefore ?? 0) > Date.now()) continue;
+      }
       const reference = snapshot.interaction?.turns[current.turnId ?? ""]?.reference ??
         snapshot.interaction?.routes?.[current.routingId ?? ""]?.reference ?? snapshot.conversations[key]!.reference;
-      const body = renderInteractionSurface(snapshot, current, this.cards);
-      if (Buffer.byteLength(JSON.stringify(body)) > 27_000) {
+      const body = this.renderSurface(snapshot, current);
+      if (Buffer.byteLength(JSON.stringify(outboundActivity({ type: "card", card: body }))) > 27_000) {
         await this.notice(key, "A detailed interaction card exceeds Teams' size limit. Use !status or !history; no action was approved.");
         await this.store.mutate((draft) => { draft.interaction!.surfaces[current.id]!.delivery = "rejected"; });
         continue;
       }
-      if (!current.activityId) await this.store.mutate((draft) => { draft.interaction!.surfaces[current.id]!.delivery = "sending"; });
+      if (!current.activityId && !await this.store.mutate((draft) => {
+        const saved = draft.interaction!.surfaces[current.id]!;
+        if (saved.frozen || saved.suppressed || saved.delivery !== "pending" || saved.activityId) return false;
+        saved.delivery = "sending";
+        return true;
+      })) continue;
       try {
         const activityId = current.activityId;
         const sentId = activityId ? (await this.transport.update(reference, activityId, body), activityId)
-          : await this.transport.send(reference, { type: "card", card: body,
-            summary: current.kind === "request" ? `${snapshot.sessions[current.sessionId ?? ""]?.name ?? "Copilot"} needs your response.`
-              : current.kind === "turn" ? "Copilot task receipt - acceptance and progress are separate." : "Copilot Sessions Inbox" });
+          : await this.transport.send(reference, { type: "card", card: body });
         await this.store.mutate((draft) => {
           const saved = draft.interaction!.surfaces[current.id]!;
           saved.activityId = sentId; saved.delivery = "ready";
           saved.renderedVersion = current.version; saved.lastUpdatedAt = Date.now();
           saved.urgent = saved.version !== current.version && saved.urgent;
           delete saved.retryAt;
+          if (current.kind === "picker" && !saved.frozen && draft.conversations[key]!.surfaceId === saved.id) {
+            draft.conversations[key]!.dashboardId = sentId; draft.conversations[key]!.dashboardState = "ready";
+          }
         });
       } catch (error) {
         logError("interaction-card-delivery", error);
@@ -2295,6 +2572,9 @@ export class Bridge {
           } else {
             saved.delivery = error instanceof DeliveryError && error.outcome !== "uncertain" ? "rejected" : "uncertain";
             draft.conversations[key]!.notice = "Interaction card delivery is unconfirmed. Use !status/!home; no prompt or response was replayed.";
+            if (current.kind === "picker" && draft.conversations[key]!.surfaceId === saved.id) {
+              draft.conversations[key]!.dashboardState = saved.delivery;
+            }
           }
         });
       }
@@ -2318,8 +2598,8 @@ export class Bridge {
         const surface = surfaceId ? snapshot.interaction?.surfaces[surfaceId] : undefined;
         if (surfaceId && !surface) throw new Error("Missing persisted result surface.");
         const message: Outbound = surface ? {
-          type: "card", card: renderInteractionSurface(snapshot, surface, this.cards),
-          summary: item.digest ? "Followed Copilot sessions have new replies." : `Copilot reply - ${item.publication!.title}`,
+          type: "card", card: this.renderSurface(snapshot, surface),
+          ...(item.digest ? { summary: "Followed Copilot sessions have new replies." } : {}),
         } : { type: "text", text: item.text, ...(item.presentation ? { presentation: item.presentation } : {}) };
         if (message.type === "card" && Buffer.byteLength(JSON.stringify(outboundActivity(message))) > 27_000) {
           logError("outbox-card-budget", new UserError("Signed card exceeds the outbound payload budget."));
@@ -2427,7 +2707,10 @@ export class Bridge {
       }
       if (this.options.interaction) {
         await this.deliverInteractionSurfaces(key);
-        if (["home", "working", "needs-reply", "dashboard"].includes(this.store.snapshot().conversations[key]!.view)) continue;
+        const latest = this.store.snapshot();
+        const current = latest.conversations[key]!;
+        if (["home", "working", "needs-reply", "dashboard"].includes(current.view) ||
+          isSessionListView(current.view) && latest.interaction?.surfaces[current.surfaceId ?? ""]?.kind === "picker") continue;
       }
       try {
         const current = this.store.snapshot().conversations[key]!;
@@ -2531,7 +2814,7 @@ export class Bridge {
       tool("bridge_select", "Select an existing canonical session ID. Does not stop any other session.",
         { sessionId: { type: "string" } }, ["sessionId"], async (key, parameters, receiptId) => {
           if (!canonicalId(parameters.sessionId)) throw new UserError("A canonical session ID is required.");
-          await this.requestHistory(key, parameters.sessionId, 10, [receiptId], true);
+          await this.openSession(key, parameters.sessionId, [receiptId]);
           return { selectedSessionId: parameters.sessionId };
         }),
       tool("bridge_read", "Read only the safe visible projection, never raw internal prompts, reasoning or tool output.",
